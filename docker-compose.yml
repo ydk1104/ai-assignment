@@ -1,0 +1,89 @@
+name: nest-app
+
+x-app-env: &app-env
+  NODE_ENV: production
+  PORT: 3000
+  # PostgreSQL
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_USER: ${POSTGRES_USER:-app}
+  DB_PASSWORD: ${POSTGRES_PASSWORD:-app_password}
+  DB_NAME: ${POSTGRES_DB:-app}
+  # Redis (BullMQ)
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  # 비워두면 시간 기반 랜덤, 정수를 넣으면 해당 seed로 고정
+  RANDOM_SEED: ${RANDOM_SEED:-}
+
+x-app-base: &app-base
+  build: .
+  environment: *app-env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api-1
+      - api-2
+    restart: unless-stopped
+
+  api-1:
+    <<: *app-base
+    command: ["node", "dist/main.js"]
+
+  api-2:
+    <<: *app-base
+    command: ["node", "dist/main.js"]
+
+  # 생성 워커: BullMQ Worker가 Redis 큐에서 job을 가져감 (nginx 불필요)
+  worker:
+    <<: *app-base
+    command: ["node", "dist/worker.js"]
+    deploy:
+      replicas: 2
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app_password}
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+    ports:
+      - "5432:5432"   # 로컬 개발용. 운영에서는 제거
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # BullMQ는 maxmemory-policy가 noeviction이어야 job이 유실되지 않음
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"   # 로컬 개발용. 운영에서는 제거
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  redis-data:
