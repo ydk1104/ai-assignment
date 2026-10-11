@@ -6,7 +6,7 @@ import {
 } from "@nestjs/common";
 import { Job, Worker } from "bullmq";
 import { hostname } from "os";
-import { createRng, parseSeed } from "../common/random";
+import { createRng } from "../common/random";
 import { redisConnection } from "../common/redis-options";
 import {
   CreateDocumentJob,
@@ -16,10 +16,14 @@ import {
   WORKER_LOCK_DURATION_MS,
 } from "../documents/document-job";
 import { IdempotencyLockService } from "../documents/idempotency-lock.service";
-import { createDelay, generateTokens } from "../documents/token-generator";
+import {
+  createContent,
+  createDelay,
+  generateTokens,
+} from "../documents/token-generator";
 import { TokenLedgerService } from "../documents/token-ledger.service";
 
-const PROGRESS_INTERVAL_MS = 100; // 진행 상황/메모 연장은 이 간격으로만 (토큰마다 Redis를 치지 않도록)
+const HEARTBEAT_INTERVAL_MS = 100; // "생성 중" 메모 연장은 이 간격으로만 (토큰마다 하지 않도록)
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -29,8 +33,6 @@ type DocumentJob = Job<CreateDocumentJob, { tokens: number }>;
 @Injectable()
 export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DocumentProcessor.name);
-  // RANDOM_SEED가 있으면 고정 seed, 없으면 job마다 시간 기반. 잘못된 값이면 시작 시 바로 에러
-  private readonly seed = parseSeed(process.env.RANDOM_SEED);
   private worker?: Worker<CreateDocumentJob, { tokens: number }>;
 
   constructor(
@@ -78,25 +80,26 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleJob(job: DocumentJob): Promise<{ tokens: number }> {
-    const { userId, idempotencyKey, requestHash, maxTokens, lockValue } =
+    const { userId, idempotencyKey, requestHash, maxTokens, lockValue, seed } =
       job.data;
     this.logger.log(
       `[${hostname()}] job ${job.id} started (userId=${userId}, maxTokens=${maxTokens})`,
     );
 
-    const rng = createRng(this.seed);
-    let lastReportAt = 0;
+    // job에 담긴 seed를 쓰므로, 워커가 바뀌어 처음부터 다시 만들어도 같은 토큰이 만들어진다
+    const rng = createRng(seed);
+    let lastBeatAt = 0;
 
-    // 진행 상황 전달 + "생성 중" 메모 연장. 실패해도 생성 자체는 계속한다
-    const report = async (generated: number, force = false) => {
-      const now = Date.now();
-      if (!force && now - lastReportAt < PROGRESS_INTERVAL_MS) return;
-      lastReportAt = now;
+    // 토큰이 하나 만들어질 때마다 API 서버로 전달 + 주기적으로 "생성 중" 메모 연장.
+    // 전달에 실패해도 생성은 계속한다 (최종 결과는 DB에 저장되고 API 서버가 그걸로 보충한다)
+    const onProgress = async (index: number, token: string) => {
       try {
-        await Promise.all([
-          job.updateProgress(generated),
-          this.locks.refresh(userId, idempotencyKey, lockValue),
-        ]);
+        await job.updateProgress({ index, token });
+        const now = Date.now();
+        if (now - lastBeatAt >= HEARTBEAT_INTERVAL_MS) {
+          lastBeatAt = now;
+          await this.locks.refresh(userId, idempotencyKey, lockValue);
+        }
       } catch (err) {
         this.logger.warn(
           `progress report failed (job ${job.id}): ${(err as Error).message}`,
@@ -114,22 +117,23 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
         return { tokens: already.tokens };
       }
 
-      const tokens = await generateTokens({
+      const contents = await generateTokens({
         maxTokens,
         rng,
         delay: createDelay(rng),
+        content: createContent(rng),
         sleep,
-        onProgress: (generated) => report(generated),
+        onProgress,
       });
-      await report(tokens, true);
 
-      // 성공했을 때만 원장/합계에 반영 (이미 반영돼 있으면 중복 없이 저장된 값을 돌려줌)
+      // 성공했을 때만 원장 + 토큰 내용 + 합계를 한 트랜잭션으로 저장
+      // (이미 저장돼 있으면 중복 없이 저장된 값을 돌려줌)
       const result = await this.ledger.record({
         userId,
         idempotencyKey,
         requestHash,
         maxTokens,
-        tokens,
+        contents,
       });
       this.logger.log(
         `[${hostname()}] job ${job.id} done: ${result.tokens} tokens (userId=${userId})`,

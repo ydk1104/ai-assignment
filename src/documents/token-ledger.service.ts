@@ -1,12 +1,17 @@
 import { Injectable, UnprocessableEntityException } from "@nestjs/common";
+import type { PoolClient } from "pg";
 import { DatabaseService } from "../database/database.service";
+
+/** 토큰 내용을 한 번에 몇 개씩 INSERT 할지 */
+const INSERT_BATCH = 2000;
 
 export interface RecordInput {
   userId: string;
   idempotencyKey: string;
   requestHash: string;
   maxTokens: number;
-  tokens: number;
+  /** 생성한 토큰들의 내용. 1번째 토큰이 contents[0]. 토큰 수 = contents.length */
+  contents: string[];
 }
 
 export interface RecordResult {
@@ -15,13 +20,25 @@ export interface RecordResult {
   replayed: boolean;
 }
 
+export interface StoredResult {
+  /** 원장 행 id (BIGINT라 문자열) */
+  id: string;
+  tokens: number;
+  requestHash: string;
+}
+
+export interface StoredToken {
+  position: number;
+  content: string;
+}
+
 @Injectable()
 export class TokenLedgerService {
   constructor(private readonly db: DatabaseService) {}
 
   /**
-   * 원장(token_ledger)에 한 줄 추가하고 유저별 합계(user_token_totals)를 올린다.
-   * 둘은 한 트랜잭션이라 항상 같이 반영되거나 같이 취소된다.
+   * 원장(token_ledger)에 한 줄 추가하고, 토큰 내용(generated_tokens)과 유저별 합계(user_token_totals)를 함께 저장한다.
+   * 셋은 한 트랜잭션이라 항상 같이 반영되거나 같이 취소된다.
    * 같은 (userId, Idempotency-Key)가 다시 오면 아무것도 쌓지 않고 저장된 값을 돌려준다.
    */
   async record(input: RecordInput): Promise<RecordResult> {
@@ -39,26 +56,45 @@ export class TokenLedgerService {
   async find(
     userId: string,
     idempotencyKey: string,
-  ): Promise<{ tokens: number; requestHash: string } | null> {
+  ): Promise<StoredResult | null> {
     const { rows } = await this.db.pool.query<{
+      id: string;
       tokens: number;
       request_hash: string;
     }>(
-      `SELECT tokens, request_hash FROM token_ledger
+      `SELECT id, tokens, request_hash FROM token_ledger
        WHERE user_id = $1 AND idempotency_key = $2`,
       [userId, idempotencyKey],
     );
-    return rows[0]
-      ? { tokens: rows[0].tokens, requestHash: rows[0].request_hash }
+    const row = rows[0];
+    return row
+      ? { id: row.id, tokens: row.tokens, requestHash: row.request_hash }
       : null;
   }
 
+  /** 저장된 토큰 내용을 번호 순서로 읽는다. after(번호)보다 큰 것만, 최대 limit개 */
+  async findTokens(
+    ledgerId: string,
+    after: number,
+    limit: number,
+  ): Promise<StoredToken[]> {
+    const { rows } = await this.db.pool.query<StoredToken>(
+      `SELECT position, content FROM generated_tokens
+       WHERE ledger_id = $1 AND position > $2
+       ORDER BY position
+       LIMIT $3`,
+      [ledgerId, after, limit],
+    );
+    return rows;
+  }
+
   private async runTransaction(input: RecordInput) {
+    const tokens = input.contents.length;
     const client = await this.db.pool.connect();
     try {
       await client.query("BEGIN");
 
-      const inserted = await client.query(
+      const inserted = await client.query<{ id: string }>(
         `INSERT INTO token_ledger (user_id, idempotency_key, request_hash, max_tokens, tokens)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (user_id, idempotency_key) DO NOTHING
@@ -68,25 +104,22 @@ export class TokenLedgerService {
           input.idempotencyKey,
           input.requestHash,
           input.maxTokens,
-          input.tokens,
+          tokens,
         ],
       );
 
       if (inserted.rowCount === 1) {
+        await this.insertTokens(client, inserted.rows[0].id, input.contents);
         await client.query(
           `INSERT INTO user_token_totals (user_id, total_tokens)
            VALUES ($1, $2)
            ON CONFLICT (user_id) DO UPDATE
              SET total_tokens = user_token_totals.total_tokens + EXCLUDED.total_tokens,
                  updated_at = now()`,
-          [input.userId, input.tokens],
+          [input.userId, tokens],
         );
         await client.query("COMMIT");
-        return {
-          tokens: input.tokens,
-          replayed: false,
-          storedHash: input.requestHash,
-        };
+        return { tokens, replayed: false, storedHash: input.requestHash };
       }
 
       const existing = await client.query<{
@@ -109,6 +142,24 @@ export class TokenLedgerService {
       throw err;
     } finally {
       client.release();
+    }
+  }
+
+  /** 토큰 내용을 INSERT_BATCH개씩 묶어서 저장 (position은 1부터) */
+  private async insertTokens(
+    client: PoolClient,
+    ledgerId: string,
+    contents: string[],
+  ) {
+    for (let start = 0; start < contents.length; start += INSERT_BATCH) {
+      const slice = contents.slice(start, start + INSERT_BATCH);
+      const positions = slice.map((_, i) => start + i + 1);
+      await client.query(
+        `INSERT INTO generated_tokens (ledger_id, position, content)
+         SELECT $1::bigint, t.position, t.content
+         FROM unnest($2::int[], $3::text[]) AS t(position, content)`,
+        [ledgerId, positions, slice],
+      );
     }
   }
 }

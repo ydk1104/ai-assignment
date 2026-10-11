@@ -13,6 +13,7 @@ import {
 } from "@nestjs/common";
 import type { Response } from "express";
 import { createHash, randomUUID } from "crypto";
+import { parseSeed } from "../common/random";
 import { CreateDocumentDto } from "./create-document.dto";
 import {
   TOKEN_CREATE_FAIL,
@@ -21,15 +22,24 @@ import {
 } from "./document-job";
 import { DocumentQueueService } from "./document-queue.service";
 import { IdempotencyLockService } from "./idempotency-lock.service";
-import { parseLastEventId, streamPoints } from "./token-count";
-import { TokenLedgerService } from "./token-ledger.service";
+import { parseLastEventId } from "./token-count";
+import { StoredResult, TokenLedgerService } from "./token-ledger.service";
 
 const KEEPALIVE_MS = 15_000; // 조용한 동안 nginx/프록시가 연결을 끊지 않도록 보내는 주석 라인 간격
 const STALL_TIMEOUT_MS = 30_000; // 워커가 시작한 뒤 이 시간 동안 진행 소식이 없으면 중단된 것으로 본다
+const PAGE_SIZE = 1000; // DB에서 저장된 토큰을 읽을 때 한 번에 가져오는 개수
 
 const DIFFERENT_BODY_MESSAGE =
   "Idempotency-Key was already used with a different request body";
 
+/**
+ * 토큰 하나를 SSE 이벤트 하나로 보낸다.
+ *  id    : 토큰 번호(1부터). 재연결 시 Last-Event-ID 로 돌아오고, 그 다음 번호부터 이어서 보낸다
+ *  tokens: 지금까지 보낸 누적 개수 (= 토큰 번호)
+ *  token : 이 토큰의 내용
+ */
+const tokenEvent = (index: number, token: string) =>
+  `id: ${index}\ndata: ${JSON.stringify({ tokens: index, token })}\n\n`;
 const doneEvent = (tokens: number) =>
   `id: ${tokens}\nevent: done\ndata: ${JSON.stringify({ tokens })}\n\n`;
 const errorEvent = (error: string, tokens: number) =>
@@ -38,6 +48,9 @@ const errorEvent = (error: string, tokens: number) =>
 @Controller("create_document")
 export class DocumentsController {
   private readonly logger = new Logger(DocumentsController.name);
+
+  // RANDOM_SEED가 있으면 고정 seed, 없으면 요청마다 시간 기반. 잘못된 값이면 서버 시작 시 바로 에러
+  private readonly fixedSeed = parseSeed(process.env.RANDOM_SEED);
 
   constructor(
     private readonly ledger: TokenLedgerService,
@@ -62,7 +75,7 @@ export class DocumentsController {
       .update(JSON.stringify([dto.prompt, dto.maxTokens]))
       .digest("hex");
 
-    // 1) 이미 끝난 요청이면 저장된 결과를 다시 보내준다 (Last-Event-ID 이후부터)
+    // 1) 이미 끝난 요청이면 DB에 저장된 결과를 다시 보내준다 (Last-Event-ID 다음 토큰부터)
     const stored = await this.ledger.find(dto.userId, key);
     if (stored) return this.replay(res, stored, requestHash, lastEventId);
 
@@ -90,6 +103,8 @@ export class DocumentsController {
         requestHash,
         maxTokens: dto.maxTokens,
         lockValue,
+        // 한 번 정한 seed를 job에 담아서, 워커가 바뀌어 다시 만들어도 같은 토큰이 만들어지게 한다
+        seed: this.fixedSeed ?? Date.now(),
       });
     } catch (err) {
       live?.cancel();
@@ -146,10 +161,46 @@ export class DocumentsController {
     res.setHeader("X-Accel-Buffering", "no"); // nginx가 버퍼링하지 않도록
   }
 
-  /** 이미 완료된 결과를 다시 보낸다. id는 누적 토큰 수라서 Last-Event-ID 다음부터 이어서 보낸다 */
-  private replay(
+  /** 쓰기 버퍼가 가득 찼으면 비워질 때까지(또는 연결이 끊길 때까지) 기다린다 */
+  private async write(res: Response, chunk: string): Promise<void> {
+    if (res.destroyed || res.writableEnded) return;
+    if (res.write(chunk)) return;
+    await new Promise<void>((resolve) => {
+      const wake = () => {
+        res.off("drain", wake);
+        res.off("close", wake);
+        resolve();
+      };
+      res.once("drain", wake);
+      res.once("close", wake);
+    });
+  }
+
+  /**
+   * DB에 저장된 토큰을 after(번호) 다음부터 끝까지 한 토큰씩 보낸다.
+   * 마지막으로 보낸 토큰 번호를 돌려준다 (연결이 끊기면 거기까지).
+   */
+  private async streamStored(
     res: Response,
-    stored: { tokens: number; requestHash: string },
+    ledgerId: string,
+    after: number,
+  ): Promise<number> {
+    let cursor = after;
+    for (;;) {
+      const rows = await this.ledger.findTokens(ledgerId, cursor, PAGE_SIZE);
+      for (const row of rows) {
+        if (res.destroyed || res.writableEnded) return cursor;
+        await this.write(res, tokenEvent(row.position, row.content));
+        cursor = row.position;
+      }
+      if (rows.length < PAGE_SIZE) return cursor;
+    }
+  }
+
+  /** 이미 완료된 결과를 다시 보낸다. 워커가 죽었든 말았든 DB에 저장된 같은 내용이 나간다 */
+  private async replay(
+    res: Response,
+    stored: StoredResult,
     requestHash: string,
     lastEventId: string | undefined,
   ) {
@@ -161,13 +212,7 @@ export class DocumentsController {
     res.flushHeaders();
     res.on("error", () => undefined);
 
-    for (const sent of streamPoints(
-      stored.tokens,
-      parseLastEventId(lastEventId),
-    )) {
-      if (res.destroyed || res.writableEnded) return;
-      res.write(`id: ${sent}\ndata: ${JSON.stringify({ tokens: sent })}\n\n`);
-    }
+    await this.streamStored(res, stored.id, parseLastEventId(lastEventId));
     if (!res.destroyed && !res.writableEnded) {
       res.write(doneEvent(stored.tokens));
       res.end();
@@ -175,11 +220,15 @@ export class DocumentsController {
   }
 
   /**
-   * 워커가 만드는 중인 job의 진행 상황을 이 응답(SSE)으로 흘려보낸다.
+   * 워커가 만드는 중인 job의 토큰을 이 응답(SSE)으로 한 토큰씩 흘려보낸다.
    * 클라이언트 연결이 끊겨도 job은 워커에서 계속 진행된다. 여기서는 구독만 해제한다.
+   *
+   * 실시간 전달은 "빠르게 보여주기 위한 것"이고, 최종 결과의 기준은 DB다.
+   * 실시간 이벤트가 중복(워커 교체 후 재전송)이거나 유실돼도, 완료 시점에 DB에서 빠진 토큰을 보충하므로
+   * 클라이언트는 항상 1번부터 마지막까지 빠짐없이 순서대로 받는다.
    */
   private attach(res: Response, jobId: string, userId: string, key: string) {
-    let lastSent = 0;
+    let lastSent = 0; // 클라이언트에 보낸 마지막 토큰 번호
     let settled = false;
     let closed = false;
     let stallTimer: NodeJS.Timeout | undefined;
@@ -189,11 +238,14 @@ export class DocumentsController {
       resolveDone = resolve;
     });
 
-    const write = (chunk: string) => {
+    const writeNow = (chunk: string) => {
       if (closed || res.writableEnded || res.destroyed) return;
       res.write(chunk);
     };
-    const keepAlive = setInterval(() => write(": keepalive\n\n"), KEEPALIVE_MS);
+    const keepAlive = setInterval(
+      () => writeNow(": keepalive\n\n"),
+      KEEPALIVE_MS,
+    );
 
     const teardown = () => {
       settled = true;
@@ -204,7 +256,7 @@ export class DocumentsController {
     const settle = (finalChunk?: string) => {
       if (settled) return;
       teardown();
-      if (finalChunk) write(finalChunk);
+      if (finalChunk) writeNow(finalChunk);
       if (!closed && !res.writableEnded) res.end();
       resolveDone();
     };
@@ -216,9 +268,16 @@ export class DocumentsController {
       );
     };
     const complete = async () => {
+      if (stallTimer) clearTimeout(stallTimer);
       try {
         const stored = await this.ledger.find(userId, key);
-        settle(doneEvent(stored?.tokens ?? lastSent));
+        if (!stored) {
+          settle(errorEvent("internal_error", lastSent));
+          return;
+        }
+        // 실시간으로 못 받은 토큰이 있으면 DB에서 보충
+        lastSent = await this.streamStored(res, stored.id, lastSent);
+        settle(doneEvent(stored.tokens));
       } catch (err) {
         this.logger.error(
           `failed to read result of job ${jobId}: ${(err as Error).message}`,
@@ -239,12 +298,13 @@ export class DocumentsController {
 
     unsubscribe = this.queue.subscribe(jobId, {
       onActive: armStall,
-      onProgress: (tokens) => {
-        if (tokens > lastSent) {
-          lastSent = tokens;
-          write(`id: ${tokens}\ndata: ${JSON.stringify({ tokens })}\n\n`);
-        }
+      onToken: (index, token) => {
         armStall();
+        // 다음 번호가 아니면 건너뛴다. 이미 보낸 번호면 워커 교체 후 재전송이고,
+        // 번호가 비면 유실이므로 완료 시점에 DB에서 채운다.
+        if (index !== lastSent + 1) return;
+        lastSent = index;
+        writeNow(tokenEvent(index, token));
       },
       onCompleted: () => {
         void complete();

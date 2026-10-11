@@ -60,6 +60,7 @@ function parseEvent(block) {
   let lastEventAt = Date.now();
   let lastPrintAt = 0;
   let lastTokens = 0;
+  let lastToken = "";
 
   for (;;) {
     const { done, value } = await reader.read();
@@ -92,9 +93,12 @@ function parseEvent(block) {
         process.exit(1);
       }
       lastTokens = ev.data.tokens;
+      lastToken = String(ev.data.token ?? "");
       if (Date.now() - lastPrintAt >= 1000) {
         lastPrintAt = Date.now();
-        console.log(`${at()} tokens=${lastTokens}`);
+        console.log(
+          `${at()} tokens=${lastTokens} last="${lastToken.slice(0, 30)}${lastToken.length > 30 ? "…" : ""}"`,
+        );
       }
     }
   }

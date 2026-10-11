@@ -5,14 +5,15 @@ import {
   CreateDocumentJob,
   DOCUMENT_JOB_NAME,
   DOCUMENT_QUEUE,
+  isTokenProgress,
 } from "./document-job";
 
 /** 특정 job의 진행 상황을 받는 쪽 (SSE 응답 하나가 하나씩 가진다) */
 export interface JobListener {
   /** 워커가 job을 집어 처리를 시작함 */
   onActive(): void;
-  /** 지금까지 생성한 누적 토큰 수 */
-  onProgress(tokens: number): void;
+  /** 워커가 토큰을 하나 만들 때마다 (번호는 1부터) */
+  onToken(index: number, token: string): void;
   onCompleted(): void;
   onFailed(reason: string): void;
 }
@@ -34,7 +35,8 @@ export class DocumentQueueService implements OnModuleInit, OnModuleDestroy {
       this.listeners.get(jobId)?.onActive(),
     );
     this.events.on("progress", ({ jobId, data }) => {
-      if (typeof data === "number") this.listeners.get(jobId)?.onProgress(data);
+      if (isTokenProgress(data))
+        this.listeners.get(jobId)?.onToken(data.index, data.token);
     });
     this.events.on("completed", ({ jobId }) =>
       this.listeners.get(jobId)?.onCompleted(),

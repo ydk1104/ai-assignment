@@ -24,6 +24,23 @@ export interface CreateDocumentJob {
   maxTokens: number;
   /** Redis의 "생성 중" 메모 값. 워커가 자기 메모만 연장/삭제하기 위해 쓴다 */
   lockValue: string;
+  /**
+   * 난수 seed. API 서버가 한 번 정해서 job에 담는다 (RANDOM_SEED가 있으면 그 값, 없으면 현재 시간).
+   * 워커가 죽어 다른 워커가 처음부터 다시 만들어도 같은 seed라서 토큰 내용이 똑같이 만들어진다.
+   */
+  seed: number;
+}
+
+/** 워커가 토큰을 하나 만들 때마다 보내는 진행 정보 (BullMQ progress) */
+export interface TokenProgress {
+  index: number;
+  token: string;
+}
+
+export function isTokenProgress(data: unknown): data is TokenProgress {
+  if (typeof data !== "object" || data === null) return false;
+  const value = data as Partial<TokenProgress>;
+  return typeof value.index === "number" && typeof value.token === "string";
 }
 
 /** Redis에 남기는 "생성 중" 메모의 내용 */

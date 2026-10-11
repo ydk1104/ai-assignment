@@ -29,6 +29,15 @@ CREATE TABLE IF NOT EXISTS token_ledger (
 
 CREATE INDEX IF NOT EXISTS idx_token_ledger_user_created
   ON token_ledger (user_id, created_at DESC);
+
+-- 생성이 완료된 요청의 토큰 내용. 워커가 죽어도 같은 응답을 다시 보내줄 수 있도록 저장한다.
+-- 원장(token_ledger)과 같은 트랜잭션에서 저장되므로 "원장에 있으면 내용도 전부 있다".
+CREATE TABLE IF NOT EXISTS generated_tokens (
+  ledger_id BIGINT       NOT NULL REFERENCES token_ledger (id) ON DELETE CASCADE,
+  position  INTEGER      NOT NULL CHECK (position > 0),
+  content   VARCHAR(256) NOT NULL,
+  PRIMARY KEY (ledger_id, position)
+);
 `;
 
 @Injectable()
