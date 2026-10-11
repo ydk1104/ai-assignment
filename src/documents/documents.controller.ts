@@ -14,7 +14,11 @@ import {
 import type { Response } from "express";
 import { createHash, randomUUID } from "crypto";
 import { CreateDocumentDto } from "./create-document.dto";
-import { TOKEN_CREATE_FAIL, lockValueOf } from "./document-job";
+import {
+  TOKEN_CREATE_FAIL,
+  isHeldLockInFlight,
+  lockValueOf,
+} from "./document-job";
 import { DocumentQueueService } from "./document-queue.service";
 import { IdempotencyLockService } from "./idempotency-lock.service";
 import { parseLastEventId, streamPoints } from "./token-count";
@@ -115,13 +119,21 @@ export class DocumentsController {
       if (await this.locks.acquire(userId, key, lockValue)) return;
 
       const held = await this.locks.get(userId, key);
-      if (held) {
-        if (held.requestHash !== requestHash) {
-          throw new UnprocessableEntityException(DIFFERENT_BODY_MESSAGE);
-        }
-        break;
+      if (!held) continue; // 확인하는 사이에 메모가 사라졌다면 다시 시도
+      if (held.requestHash !== requestHash) {
+        throw new UnprocessableEntityException(DIFFERENT_BODY_MESSAGE);
       }
-      // 확인하는 사이에 메모가 사라졌다면 다시 시도
+
+      // 메모가 있어도 그 job이 실제로 살아있는지 확인한다.
+      // (워커가 죽어서 복구를 기다리는 중이면 waiting/active 이므로 계속 "처리중")
+      const state = await this.queue.getJobState(held.jobId);
+      if (isHeldLockInFlight(state, held.createdAt)) break;
+
+      // job은 끝났거나 사라졌는데 메모만 남은 경우 -> 지우고 다시 시도
+      this.logger.warn(
+        `clearing stale idempotency memo (job ${held.jobId}, state=${state ?? "missing"})`,
+      );
+      await this.locks.release(userId, key, held.raw);
     }
     res.setHeader("Retry-After", "1");
     throw new ConflictException("처리중입니다.");

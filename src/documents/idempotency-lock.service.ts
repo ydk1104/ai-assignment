@@ -1,15 +1,16 @@
 import { Injectable } from "@nestjs/common";
 import { RedisService } from "../redis/redis.service";
-import { LockValue, parseLockValue } from "./document-job";
+import { HeldLock, parseLockValue } from "./document-job";
 
 /**
  * 같은 Idempotency-Key로 이미 생성 중인지 Redis에 메모해두는 용도.
  * API 서버가 여러 대여도 Redis 한 곳에서 판단하므로, 서로 다른 서버로 같은 요청이 들어와도 한 번만 생성된다.
  *
- * 메모에는 TTL을 걸고 워커가 생성 중에 계속 연장(heartbeat)한다.
- * 워커가 죽으면 TTL이 지나 메모가 사라지므로 영원히 "처리중"으로 남지 않는다.
+ * "처리 중인지"의 기준은 TTL이 아니라 메모에 적힌 job의 실제 상태다 (isHeldLockInFlight).
+ * 워커가 죽어서 다른 워커가 이어받기를 기다리는 동안에도 메모가 사라지면 안 되므로 TTL은 길게 잡고,
+ * 워커가 생성 중에 계속 연장한다. TTL은 정리되지 않은 메모가 영원히 남지 않게 하는 마지막 안전장치다.
  */
-const LOCK_TTL_MS = 30_000;
+const LOCK_TTL_MS = 60 * 60 * 1000;
 
 // 내가 만든 메모일 때만 삭제 / 연장 (값 비교와 삭제를 원자적으로 처리)
 const RELEASE_LUA = `
@@ -49,7 +50,7 @@ export class IdempotencyLockService {
     return result === "OK";
   }
 
-  async get(userId: string, idempotencyKey: string): Promise<LockValue | null> {
+  async get(userId: string, idempotencyKey: string): Promise<HeldLock | null> {
     return parseLockValue(
       await this.redis.client.get(this.redisKey(userId, idempotencyKey)),
     );

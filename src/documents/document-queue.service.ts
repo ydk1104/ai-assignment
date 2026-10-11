@@ -58,6 +58,12 @@ export class DocumentQueueService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
+  /** job의 현재 상태 (waiting/active/completed/failed ...). 큐에 없으면 null */
+  async getJobState(jobId: string): Promise<string | null> {
+    const job = await this.queue.getJob(jobId);
+    return job ? await job.getState() : null;
+  }
+
   async enqueue(jobId: string, data: CreateDocumentJob): Promise<void> {
     await this.queue.add(DOCUMENT_JOB_NAME, data, {
       jobId,
