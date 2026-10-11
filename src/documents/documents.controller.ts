@@ -1,117 +1,239 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Headers,
+  HttpException,
   Logger,
   Post,
   Res,
-} from "@nestjs/common";
-import type { Response } from "express";
-import { createHash } from "crypto";
-import { createRng, parseSeed } from "../common/random";
-import { CreateDocumentDto } from "./create-document.dto";
-import { parseLastEventId, pickTokenCount, streamPoints } from "./token-count";
-import { TokenLedgerService } from "./token-ledger.service";
+  ServiceUnavailableException,
+  UnprocessableEntityException,
+} from '@nestjs/common';
+import type { Response } from 'express';
+import { createHash, randomUUID } from 'crypto';
+import { CreateDocumentDto } from './create-document.dto';
+import { TOKEN_CREATE_FAIL, lockValueOf } from './document-job';
+import { DocumentQueueService } from './document-queue.service';
+import { IdempotencyLockService } from './idempotency-lock.service';
+import { parseLastEventId, streamPoints } from './token-count';
+import { TokenLedgerService } from './token-ledger.service';
 
-const STEP_DELAY_MS = 100;
+const KEEPALIVE_MS = 15_000; // 조용한 동안 nginx/프록시가 연결을 끊지 않도록 보내는 주석 라인 간격
+const STALL_TIMEOUT_MS = 30_000; // 워커가 시작한 뒤 이 시간 동안 진행 소식이 없으면 중단된 것으로 본다
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const DIFFERENT_BODY_MESSAGE = 'Idempotency-Key was already used with a different request body';
 
-@Controller("create_document")
+const doneEvent = (tokens: number) =>
+  `id: ${tokens}\nevent: done\ndata: ${JSON.stringify({ tokens })}\n\n`;
+const errorEvent = (error: string, tokens: number) =>
+  `event: error\ndata: ${JSON.stringify({ error, tokens })}\n\n`;
+
+@Controller('create_document')
 export class DocumentsController {
   private readonly logger = new Logger(DocumentsController.name);
 
-  // RANDOM_SEED가 있으면 고정 seed, 없으면 요청마다 시간 기반. 잘못된 값이면 서버 시작 시 바로 에러
-  private readonly seed = parseSeed(process.env.RANDOM_SEED);
-
-  constructor(private readonly ledger: TokenLedgerService) {}
+  constructor(
+    private readonly ledger: TokenLedgerService,
+    private readonly locks: IdempotencyLockService,
+    private readonly queue: DocumentQueueService,
+  ) {}
 
   @Post()
   async create(
     @Body() dto: CreateDocumentDto,
-    @Headers("idempotency-key") idempotencyKey: string | undefined,
-    @Headers("last-event-id") lastEventId: string | undefined,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Headers('last-event-id') lastEventId: string | undefined,
     @Res() res: Response,
   ) {
     const key = idempotencyKey?.trim();
     if (!key || key.length > 255) {
-      throw new BadRequestException(
-        "Idempotency-Key header is required (max 255 chars)",
-      );
+      throw new BadRequestException('Idempotency-Key header is required (max 255 chars)');
+    }
+    const requestHash = createHash('sha256')
+      .update(JSON.stringify([dto.prompt, dto.maxTokens]))
+      .digest('hex');
+
+    // 1) 이미 끝난 요청이면 저장된 결과를 다시 보내준다 (Last-Event-ID 이후부터)
+    const stored = await this.ledger.find(dto.userId, key);
+    if (stored) return this.replay(res, stored, requestHash, lastEventId);
+
+    // 2) 생성 중이라는 메모를 Redis에 남긴다. 이미 있으면 "처리중입니다."
+    const jobId = randomUUID();
+    const lockValue = lockValueOf(jobId, requestHash);
+    await this.acquireOrReject(res, dto.userId, key, lockValue, requestHash);
+
+    let live: { cancel: () => void; done: Promise<void> } | undefined;
+    try {
+      // 3) 메모를 잡는 사이에 다른 서버가 막 끝냈을 수 있으니 원장을 한 번 더 확인한다
+      //    (워커는 원장 기록 -> 메모 삭제 순서로 끝내므로, 메모를 잡았다면 원장은 이미 보인다)
+      const finished = await this.ledger.find(dto.userId, key);
+      if (finished) {
+        await this.locks.release(dto.userId, key, lockValue);
+        return this.replay(res, finished, requestHash, lastEventId);
+      }
+
+      // 4) 이벤트 구독 -> 큐에 넣기 -> SSE 시작
+      this.setSseHeaders(res);
+      live = this.attach(res, jobId, dto.userId, key);
+      await this.queue.enqueue(jobId, {
+        userId: dto.userId,
+        idempotencyKey: key,
+        requestHash,
+        maxTokens: dto.maxTokens,
+        lockValue,
+      });
+    } catch (err) {
+      live?.cancel();
+      await this.locks.release(dto.userId, key, lockValue).catch(() => undefined);
+      if (err instanceof HttpException) throw err;
+      this.logger.error(`failed to enqueue job ${jobId}: ${(err as Error).message}`);
+      throw new ServiceUnavailableException('Could not start generation');
     }
 
-    const tokens = pickTokenCount(dto.maxTokens, createRng(this.seed));
-    const requestHash = createHash("sha256")
-      .update(JSON.stringify([dto.prompt, dto.maxTokens]))
-      .digest("hex");
-
-    // 스트림 시작 전에 DB 반영 (실패하면 일반 HTTP 에러로 응답)
-    const result = await this.ledger.record({
-      userId: dto.userId,
-      idempotencyKey: key,
-      requestHash,
-      maxTokens: dto.maxTokens,
-      tokens,
-    });
-
-    // 같은 Idempotency-Key로 재연결한 경우에만 Last-Event-ID 이후부터 이어서 보낸다
-    const resumeFrom = result.replayed ? parseLastEventId(lastEventId) : 0;
-
-    res.status(200);
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("X-Accel-Buffering", "no"); // nginx가 버퍼링하지 않도록
-    if (result.replayed) res.setHeader("Idempotent-Replayed", "true");
     res.flushHeaders();
+    await live.done;
+  }
 
-    await this.streamTokenCount(res, result.tokens, resumeFrom);
+  /** 메모를 남기거나, 이미 있으면 상황에 맞게 거절한다 */
+  private async acquireOrReject(
+    res: Response,
+    userId: string,
+    key: string,
+    lockValue: string,
+    requestHash: string,
+  ): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (await this.locks.acquire(userId, key, lockValue)) return;
+
+      const held = await this.locks.get(userId, key);
+      if (held) {
+        if (held.requestHash !== requestHash) {
+          throw new UnprocessableEntityException(DIFFERENT_BODY_MESSAGE);
+        }
+        break;
+      }
+      // 확인하는 사이에 메모가 사라졌다면 다시 시도
+    }
+    res.setHeader('Retry-After', '1');
+    throw new ConflictException('처리중입니다.');
+  }
+
+  private setSseHeaders(res: Response) {
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('X-Accel-Buffering', 'no'); // nginx가 버퍼링하지 않도록
+  }
+
+  /** 이미 완료된 결과를 다시 보낸다. id는 누적 토큰 수라서 Last-Event-ID 다음부터 이어서 보낸다 */
+  private replay(
+    res: Response,
+    stored: { tokens: number; requestHash: string },
+    requestHash: string,
+    lastEventId: string | undefined,
+  ) {
+    if (stored.requestHash !== requestHash) {
+      throw new UnprocessableEntityException(DIFFERENT_BODY_MESSAGE);
+    }
+    this.setSseHeaders(res);
+    res.setHeader('Idempotent-Replayed', 'true');
+    res.flushHeaders();
+    res.on('error', () => undefined);
+
+    for (const sent of streamPoints(stored.tokens, parseLastEventId(lastEventId))) {
+      if (res.destroyed || res.writableEnded) return;
+      res.write(`id: ${sent}\ndata: ${JSON.stringify({ tokens: sent })}\n\n`);
+    }
+    if (!res.destroyed && !res.writableEnded) {
+      res.write(doneEvent(stored.tokens));
+      res.end();
+    }
   }
 
   /**
-   * 누적 토큰 수를 SSE로 흘려보낸다. 각 이벤트의 id는 그 시점의 누적 토큰 수이다.
-   * - resumeFrom(Last-Event-ID) 이하는 이미 받은 것이므로 건너뛰고 그 다음부터 보낸다.
-   * - 클라이언트 연결이 끊겨도 생성(루프)은 끝까지 진행하고, 끊긴 뒤에는 전송만 건너뛴다.
-   *   (원장 기록은 스트림 시작 전에 이미 끝나 있으므로 연결이 끊겨도 DB 상태는 항상 일관적이다)
+   * 워커가 만드는 중인 job의 진행 상황을 이 응답(SSE)으로 흘려보낸다.
+   * 클라이언트 연결이 끊겨도 job은 워커에서 계속 진행된다. 여기서는 구독만 해제한다.
    */
-  private async streamTokenCount(
-    res: Response,
-    total: number,
-    resumeFrom: number,
-  ) {
-    let disconnected = false;
-    res.on("close", () => {
-      if (!res.writableEnded) disconnected = true;
+  private attach(res: Response, jobId: string, userId: string, key: string) {
+    let lastSent = 0;
+    let settled = false;
+    let closed = false;
+    let stallTimer: NodeJS.Timeout | undefined;
+    let unsubscribe: () => void = () => undefined;
+    let resolveDone: () => void = () => undefined;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
     });
-    // 이미 끊긴 소켓에 쓰다 발생하는 에러가 프로세스를 죽이지 않도록
-    res.on("error", () => undefined);
 
-    // 연결이 살아있을 때만 쓰고, 실제로 썼는지 돌려준다
-    const send = (chunk: string): boolean => {
-      if (disconnected || res.writableEnded || res.destroyed) return false;
+    const write = (chunk: string) => {
+      if (closed || res.writableEnded || res.destroyed) return;
       res.write(chunk);
-      return true;
+    };
+    const keepAlive = setInterval(() => write(': keepalive\n\n'), KEEPALIVE_MS);
+
+    const teardown = () => {
+      settled = true;
+      clearInterval(keepAlive);
+      if (stallTimer) clearTimeout(stallTimer);
+      unsubscribe();
+    };
+    const settle = (finalChunk?: string) => {
+      if (settled) return;
+      teardown();
+      if (finalChunk) write(finalChunk);
+      if (!closed && !res.writableEnded) res.end();
+      resolveDone();
+    };
+    const armStall = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(
+        () => settle(errorEvent('generation_stalled', lastSent)),
+        STALL_TIMEOUT_MS,
+      );
+    };
+    const complete = async () => {
+      try {
+        const stored = await this.ledger.find(userId, key);
+        settle(doneEvent(stored?.tokens ?? lastSent));
+      } catch (err) {
+        this.logger.error(`failed to read result of job ${jobId}: ${(err as Error).message}`);
+        settle(errorEvent('internal_error', lastSent));
+      }
     };
 
-    let delivered = Math.min(resumeFrom, total); // 클라이언트가 받은 마지막 누적 토큰 수
-    const points = streamPoints(total, resumeFrom);
-    for (let i = 0; i < points.length; i++) {
-      const sent = points[i];
-      if (send(`id: ${sent}\ndata: ${JSON.stringify({ tokens: sent })}\n\n`))
-        delivered = sent;
-      if (i < points.length - 1) await sleep(STEP_DELAY_MS); // 연결 여부와 상관없이 계속 진행
-    }
+    res.on('error', () => undefined);
+    res.on('close', () => {
+      if (settled) return; // 우리가 정상 종료한 뒤에 오는 close
+      closed = true;
+      this.logger.log(`client disconnected (job ${jobId}); generation continues in worker`);
+      settle();
+    });
 
-    if (
-      send(
-        `id: ${total}\nevent: done\ndata: ${JSON.stringify({ tokens: total })}\n\n`,
-      )
-    ) {
-      res.end();
-    } else {
-      this.logger.warn(
-        `client disconnected after ${delivered}/${total} tokens; generation completed`,
-      );
-    }
+    unsubscribe = this.queue.subscribe(jobId, {
+      onActive: armStall,
+      onProgress: (tokens) => {
+        if (tokens > lastSent) {
+          lastSent = tokens;
+          write(`id: ${tokens}\ndata: ${JSON.stringify({ tokens })}\n\n`);
+        }
+        armStall();
+      },
+      onCompleted: () => {
+        void complete();
+      },
+      onFailed: (reason) => {
+        // 의도한 에러만 이름 그대로 알려주고, 나머지는 내부 에러 내용을 숨긴다
+        const error = reason === TOKEN_CREATE_FAIL ? TOKEN_CREATE_FAIL : 'internal_error';
+        settle(errorEvent(error, lastSent));
+      },
+    });
+
+    return {
+      // enqueue 실패 시: 구독/타이머만 정리 (응답은 호출한 쪽이 에러로 마무리)
+      cancel: teardown,
+      done,
+    };
   }
 }

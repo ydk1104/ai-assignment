@@ -1,7 +1,8 @@
 name: nest-app
 
 x-app-env: &app-env
-  NODE_ENV: production
+  # production: 토큰 생성 지연 20~80ms 무작위 / 그 외(development 등): 10ms 고정 (.env의 APP_ENV로 전환)
+  NODE_ENV: ${APP_ENV:-production}
   PORT: 3000
   # PostgreSQL
   DB_HOST: postgres
@@ -72,7 +73,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app_password}
       POSTGRES_DB: ${POSTGRES_DB:-app}
     ports:
-      - "5432:5432" # 로컬 개발용. 운영에서는 제거
+      - "5432:5432"   # 로컬 개발용. 운영에서는 제거
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
@@ -85,16 +86,9 @@ services:
   redis:
     image: redis:7-alpine
     # BullMQ는 maxmemory-policy가 noeviction이어야 job이 유실되지 않음
-    command:
-      [
-        "redis-server",
-        "--appendonly",
-        "yes",
-        "--maxmemory-policy",
-        "noeviction",
-      ]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
     ports:
-      - "6379:6379" # 로컬 개발용. 운영에서는 제거
+      - "6379:6379"   # 로컬 개발용. 운영에서는 제거
     volumes:
       - redis-data:/data
     healthcheck:
