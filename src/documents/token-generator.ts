@@ -1,6 +1,6 @@
-import { randomInt, type Rng } from '../common/random';
-import { TOKEN_CREATE_FAIL } from './document-job';
-import { pickTokenCount } from './token-count';
+import { randomInt, type Rng } from "../common/random";
+import { TOKEN_CREATE_FAIL } from "./document-job";
+import { pickTokenCount } from "./token-count";
 
 /** 생성 도중 에러가 날 확률 */
 export const FAIL_RATE = 0.1;
@@ -27,7 +27,7 @@ export function createDelay(
   rng: Rng,
   nodeEnv: string | undefined = process.env.NODE_ENV,
 ): () => number {
-  if (nodeEnv === 'production') return () => randomInt(rng, 20, 80);
+  if (nodeEnv === "production") return () => randomInt(rng, 20, 80);
   return () => 10;
 }
 
@@ -52,8 +52,17 @@ export interface GenerateOptions {
  * 그 뒤 실제로 토큰을 하나씩 만들면서(지연 포함) 누적 개수가 failAt에 도달하는 순간 에러를 던진다.
  * failAt이 0이면 하나도 만들기 전에, N이면 전부 만든 직후에 실패한다.
  */
-export async function generateTokens(options: GenerateOptions): Promise<number> {
-  const { maxTokens, rng, delay, sleep, onProgress, failRate = FAIL_RATE } = options;
+export async function generateTokens(
+  options: GenerateOptions,
+): Promise<number> {
+  const {
+    maxTokens,
+    rng,
+    delay,
+    sleep,
+    onProgress,
+    failRate = FAIL_RATE,
+  } = options;
 
   const total = pickTokenCount(maxTokens, rng);
   const willFail = rng() < failRate;

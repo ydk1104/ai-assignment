@@ -10,27 +10,28 @@ import {
   Res,
   ServiceUnavailableException,
   UnprocessableEntityException,
-} from '@nestjs/common';
-import type { Response } from 'express';
-import { createHash, randomUUID } from 'crypto';
-import { CreateDocumentDto } from './create-document.dto';
-import { TOKEN_CREATE_FAIL, lockValueOf } from './document-job';
-import { DocumentQueueService } from './document-queue.service';
-import { IdempotencyLockService } from './idempotency-lock.service';
-import { parseLastEventId, streamPoints } from './token-count';
-import { TokenLedgerService } from './token-ledger.service';
+} from "@nestjs/common";
+import type { Response } from "express";
+import { createHash, randomUUID } from "crypto";
+import { CreateDocumentDto } from "./create-document.dto";
+import { TOKEN_CREATE_FAIL, lockValueOf } from "./document-job";
+import { DocumentQueueService } from "./document-queue.service";
+import { IdempotencyLockService } from "./idempotency-lock.service";
+import { parseLastEventId, streamPoints } from "./token-count";
+import { TokenLedgerService } from "./token-ledger.service";
 
 const KEEPALIVE_MS = 15_000; // 조용한 동안 nginx/프록시가 연결을 끊지 않도록 보내는 주석 라인 간격
 const STALL_TIMEOUT_MS = 30_000; // 워커가 시작한 뒤 이 시간 동안 진행 소식이 없으면 중단된 것으로 본다
 
-const DIFFERENT_BODY_MESSAGE = 'Idempotency-Key was already used with a different request body';
+const DIFFERENT_BODY_MESSAGE =
+  "Idempotency-Key was already used with a different request body";
 
 const doneEvent = (tokens: number) =>
   `id: ${tokens}\nevent: done\ndata: ${JSON.stringify({ tokens })}\n\n`;
 const errorEvent = (error: string, tokens: number) =>
   `event: error\ndata: ${JSON.stringify({ error, tokens })}\n\n`;
 
-@Controller('create_document')
+@Controller("create_document")
 export class DocumentsController {
   private readonly logger = new Logger(DocumentsController.name);
 
@@ -43,17 +44,19 @@ export class DocumentsController {
   @Post()
   async create(
     @Body() dto: CreateDocumentDto,
-    @Headers('idempotency-key') idempotencyKey: string | undefined,
-    @Headers('last-event-id') lastEventId: string | undefined,
+    @Headers("idempotency-key") idempotencyKey: string | undefined,
+    @Headers("last-event-id") lastEventId: string | undefined,
     @Res() res: Response,
   ) {
     const key = idempotencyKey?.trim();
     if (!key || key.length > 255) {
-      throw new BadRequestException('Idempotency-Key header is required (max 255 chars)');
+      throw new BadRequestException(
+        "Idempotency-Key header is required (max 255 chars)",
+      );
     }
-    const requestHash = createHash('sha256')
+    const requestHash = createHash("sha256")
       .update(JSON.stringify([dto.prompt, dto.maxTokens]))
-      .digest('hex');
+      .digest("hex");
 
     // 1) 이미 끝난 요청이면 저장된 결과를 다시 보내준다 (Last-Event-ID 이후부터)
     const stored = await this.ledger.find(dto.userId, key);
@@ -86,10 +89,14 @@ export class DocumentsController {
       });
     } catch (err) {
       live?.cancel();
-      await this.locks.release(dto.userId, key, lockValue).catch(() => undefined);
+      await this.locks
+        .release(dto.userId, key, lockValue)
+        .catch(() => undefined);
       if (err instanceof HttpException) throw err;
-      this.logger.error(`failed to enqueue job ${jobId}: ${(err as Error).message}`);
-      throw new ServiceUnavailableException('Could not start generation');
+      this.logger.error(
+        `failed to enqueue job ${jobId}: ${(err as Error).message}`,
+      );
+      throw new ServiceUnavailableException("Could not start generation");
     }
 
     res.flushHeaders();
@@ -116,15 +123,15 @@ export class DocumentsController {
       }
       // 확인하는 사이에 메모가 사라졌다면 다시 시도
     }
-    res.setHeader('Retry-After', '1');
-    throw new ConflictException('처리중입니다.');
+    res.setHeader("Retry-After", "1");
+    throw new ConflictException("처리중입니다.");
   }
 
   private setSseHeaders(res: Response) {
     res.status(200);
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('X-Accel-Buffering', 'no'); // nginx가 버퍼링하지 않도록
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("X-Accel-Buffering", "no"); // nginx가 버퍼링하지 않도록
   }
 
   /** 이미 완료된 결과를 다시 보낸다. id는 누적 토큰 수라서 Last-Event-ID 다음부터 이어서 보낸다 */
@@ -138,11 +145,14 @@ export class DocumentsController {
       throw new UnprocessableEntityException(DIFFERENT_BODY_MESSAGE);
     }
     this.setSseHeaders(res);
-    res.setHeader('Idempotent-Replayed', 'true');
+    res.setHeader("Idempotent-Replayed", "true");
     res.flushHeaders();
-    res.on('error', () => undefined);
+    res.on("error", () => undefined);
 
-    for (const sent of streamPoints(stored.tokens, parseLastEventId(lastEventId))) {
+    for (const sent of streamPoints(
+      stored.tokens,
+      parseLastEventId(lastEventId),
+    )) {
       if (res.destroyed || res.writableEnded) return;
       res.write(`id: ${sent}\ndata: ${JSON.stringify({ tokens: sent })}\n\n`);
     }
@@ -171,7 +181,7 @@ export class DocumentsController {
       if (closed || res.writableEnded || res.destroyed) return;
       res.write(chunk);
     };
-    const keepAlive = setInterval(() => write(': keepalive\n\n'), KEEPALIVE_MS);
+    const keepAlive = setInterval(() => write(": keepalive\n\n"), KEEPALIVE_MS);
 
     const teardown = () => {
       settled = true;
@@ -189,7 +199,7 @@ export class DocumentsController {
     const armStall = () => {
       if (stallTimer) clearTimeout(stallTimer);
       stallTimer = setTimeout(
-        () => settle(errorEvent('generation_stalled', lastSent)),
+        () => settle(errorEvent("generation_stalled", lastSent)),
         STALL_TIMEOUT_MS,
       );
     };
@@ -198,16 +208,20 @@ export class DocumentsController {
         const stored = await this.ledger.find(userId, key);
         settle(doneEvent(stored?.tokens ?? lastSent));
       } catch (err) {
-        this.logger.error(`failed to read result of job ${jobId}: ${(err as Error).message}`);
-        settle(errorEvent('internal_error', lastSent));
+        this.logger.error(
+          `failed to read result of job ${jobId}: ${(err as Error).message}`,
+        );
+        settle(errorEvent("internal_error", lastSent));
       }
     };
 
-    res.on('error', () => undefined);
-    res.on('close', () => {
+    res.on("error", () => undefined);
+    res.on("close", () => {
       if (settled) return; // 우리가 정상 종료한 뒤에 오는 close
       closed = true;
-      this.logger.log(`client disconnected (job ${jobId}); generation continues in worker`);
+      this.logger.log(
+        `client disconnected (job ${jobId}); generation continues in worker`,
+      );
       settle();
     });
 
@@ -225,7 +239,8 @@ export class DocumentsController {
       },
       onFailed: (reason) => {
         // 의도한 에러만 이름 그대로 알려주고, 나머지는 내부 에러 내용을 숨긴다
-        const error = reason === TOKEN_CREATE_FAIL ? TOKEN_CREATE_FAIL : 'internal_error';
+        const error =
+          reason === TOKEN_CREATE_FAIL ? TOKEN_CREATE_FAIL : "internal_error";
         settle(errorEvent(error, lastSent));
       },
     });

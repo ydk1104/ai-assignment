@@ -1,5 +1,5 @@
-import { Injectable, UnprocessableEntityException } from '@nestjs/common';
-import { DatabaseService } from '../database/database.service';
+import { Injectable, UnprocessableEntityException } from "@nestjs/common";
+import { DatabaseService } from "../database/database.service";
 
 export interface RecordInput {
   userId: string;
@@ -29,7 +29,7 @@ export class TokenLedgerService {
 
     if (replayed && storedHash !== input.requestHash) {
       throw new UnprocessableEntityException(
-        'Idempotency-Key was already used with a different request body',
+        "Idempotency-Key was already used with a different request body",
       );
     }
     return { tokens, replayed };
@@ -40,25 +40,36 @@ export class TokenLedgerService {
     userId: string,
     idempotencyKey: string,
   ): Promise<{ tokens: number; requestHash: string } | null> {
-    const { rows } = await this.db.pool.query<{ tokens: number; request_hash: string }>(
+    const { rows } = await this.db.pool.query<{
+      tokens: number;
+      request_hash: string;
+    }>(
       `SELECT tokens, request_hash FROM token_ledger
        WHERE user_id = $1 AND idempotency_key = $2`,
       [userId, idempotencyKey],
     );
-    return rows[0] ? { tokens: rows[0].tokens, requestHash: rows[0].request_hash } : null;
+    return rows[0]
+      ? { tokens: rows[0].tokens, requestHash: rows[0].request_hash }
+      : null;
   }
 
   private async runTransaction(input: RecordInput) {
     const client = await this.db.pool.connect();
     try {
-      await client.query('BEGIN');
+      await client.query("BEGIN");
 
       const inserted = await client.query(
         `INSERT INTO token_ledger (user_id, idempotency_key, request_hash, max_tokens, tokens)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (user_id, idempotency_key) DO NOTHING
          RETURNING id`,
-        [input.userId, input.idempotencyKey, input.requestHash, input.maxTokens, input.tokens],
+        [
+          input.userId,
+          input.idempotencyKey,
+          input.requestHash,
+          input.maxTokens,
+          input.tokens,
+        ],
       );
 
       if (inserted.rowCount === 1) {
@@ -70,20 +81,31 @@ export class TokenLedgerService {
                  updated_at = now()`,
           [input.userId, input.tokens],
         );
-        await client.query('COMMIT');
-        return { tokens: input.tokens, replayed: false, storedHash: input.requestHash };
+        await client.query("COMMIT");
+        return {
+          tokens: input.tokens,
+          replayed: false,
+          storedHash: input.requestHash,
+        };
       }
 
-      const existing = await client.query<{ request_hash: string; tokens: number }>(
+      const existing = await client.query<{
+        request_hash: string;
+        tokens: number;
+      }>(
         `SELECT request_hash, tokens FROM token_ledger
          WHERE user_id = $1 AND idempotency_key = $2`,
         [input.userId, input.idempotencyKey],
       );
-      await client.query('COMMIT');
+      await client.query("COMMIT");
       const row = existing.rows[0];
-      return { tokens: row.tokens, replayed: true, storedHash: row.request_hash };
+      return {
+        tokens: row.tokens,
+        replayed: true,
+        storedHash: row.request_hash,
+      };
     } catch (err) {
-      await client.query('ROLLBACK').catch(() => undefined);
+      await client.query("ROLLBACK").catch(() => undefined);
       throw err;
     } finally {
       client.release();

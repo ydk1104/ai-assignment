@@ -1,6 +1,6 @@
-import { Injectable } from '@nestjs/common';
-import { RedisService } from '../redis/redis.service';
-import { LockValue, parseLockValue } from './document-job';
+import { Injectable } from "@nestjs/common";
+import { RedisService } from "../redis/redis.service";
+import { LockValue, parseLockValue } from "./document-job";
 
 /**
  * 같은 Idempotency-Key로 이미 생성 중인지 Redis에 메모해두는 용도.
@@ -34,23 +34,33 @@ export class IdempotencyLockService {
   }
 
   /** 메모 남기기 (이미 있으면 false) */
-  async acquire(userId: string, idempotencyKey: string, value: string): Promise<boolean> {
+  async acquire(
+    userId: string,
+    idempotencyKey: string,
+    value: string,
+  ): Promise<boolean> {
     const result = await this.redis.client.set(
       this.redisKey(userId, idempotencyKey),
       value,
-      'PX',
+      "PX",
       LOCK_TTL_MS,
-      'NX',
+      "NX",
     );
-    return result === 'OK';
+    return result === "OK";
   }
 
   async get(userId: string, idempotencyKey: string): Promise<LockValue | null> {
-    return parseLockValue(await this.redis.client.get(this.redisKey(userId, idempotencyKey)));
+    return parseLockValue(
+      await this.redis.client.get(this.redisKey(userId, idempotencyKey)),
+    );
   }
 
   /** 내 메모일 때만 TTL 연장 */
-  async refresh(userId: string, idempotencyKey: string, value: string): Promise<boolean> {
+  async refresh(
+    userId: string,
+    idempotencyKey: string,
+    value: string,
+  ): Promise<boolean> {
     const result = await this.redis.client.eval(
       REFRESH_LUA,
       1,
@@ -62,7 +72,11 @@ export class IdempotencyLockService {
   }
 
   /** 내 메모일 때만 삭제 */
-  async release(userId: string, idempotencyKey: string, value: string): Promise<boolean> {
+  async release(
+    userId: string,
+    idempotencyKey: string,
+    value: string,
+  ): Promise<boolean> {
     const result = await this.redis.client.eval(
       RELEASE_LUA,
       1,

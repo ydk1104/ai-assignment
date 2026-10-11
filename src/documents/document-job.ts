@@ -1,8 +1,8 @@
-export const DOCUMENT_QUEUE = 'create-document';
-export const DOCUMENT_JOB_NAME = 'create-document';
+export const DOCUMENT_QUEUE = "create-document";
+export const DOCUMENT_JOB_NAME = "create-document";
 
 /** 토큰 생성 중 의도적으로 내는 에러의 이름(= message). 클라이언트에도 이 값으로 전달된다 */
-export const TOKEN_CREATE_FAIL = 'token_create_fail';
+export const TOKEN_CREATE_FAIL = "token_create_fail";
 
 /** API 서버가 큐에 넣고 워커가 꺼내 처리하는 작업 */
 export interface CreateDocumentJob {
