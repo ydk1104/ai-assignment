@@ -40,8 +40,9 @@ const DIFFERENT_BODY_MESSAGE =
  */
 const tokenEvent = (index: number, token: string) =>
   `id: ${index}\ndata: ${JSON.stringify({ tokens: index, token })}\n\n`;
-const doneEvent = (tokens: number) =>
-  `id: ${tokens}\nevent: done\ndata: ${JSON.stringify({ tokens })}\n\n`;
+/** cancelled: 취소로 끝난 경우 true (그때까지 만든 tokens개만 확정됨) */
+const doneEvent = (tokens: number, cancelled: boolean) =>
+  `id: ${tokens}\nevent: done\ndata: ${JSON.stringify({ tokens, cancelled })}\n\n`;
 const errorEvent = (error: string, tokens: number) =>
   `event: error\ndata: ${JSON.stringify({ error, tokens })}\n\n`;
 
@@ -214,7 +215,7 @@ export class DocumentsController {
 
     await this.streamStored(res, stored.id, parseLastEventId(lastEventId));
     if (!res.destroyed && !res.writableEnded) {
-      res.write(doneEvent(stored.tokens));
+      res.write(doneEvent(stored.tokens, stored.cancelled));
       res.end();
     }
   }
@@ -277,7 +278,7 @@ export class DocumentsController {
         }
         // 실시간으로 못 받은 토큰이 있으면 DB에서 보충
         lastSent = await this.streamStored(res, stored.id, lastSent);
-        settle(doneEvent(stored.tokens));
+        settle(doneEvent(stored.tokens, stored.cancelled));
       } catch (err) {
         this.logger.error(
           `failed to read result of job ${jobId}: ${(err as Error).message}`,

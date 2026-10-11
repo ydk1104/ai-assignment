@@ -22,10 +22,23 @@ CREATE TABLE IF NOT EXISTS token_ledger (
   idempotency_key TEXT NOT NULL,
   request_hash    TEXT NOT NULL,
   max_tokens      INTEGER NOT NULL CHECK (max_tokens > 0),
-  tokens          INTEGER NOT NULL CHECK (tokens > 0),
+  tokens          INTEGER NOT NULL,
+  cancelled       BOOLEAN NOT NULL DEFAULT false,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (user_id, idempotency_key)
 );
+
+-- 이전 버전에서 만든 테이블 보정
+--  - cancelled: 취소로 끝난 요청인지
+--  - tokens >= 0: 시작하기 전에 취소하면 0개로 확정될 수 있다 (이전에는 tokens > 0 이었음)
+ALTER TABLE token_ledger ADD COLUMN IF NOT EXISTS cancelled BOOLEAN NOT NULL DEFAULT false;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'token_ledger_tokens_nonneg') THEN
+    ALTER TABLE token_ledger DROP CONSTRAINT IF EXISTS token_ledger_tokens_check;
+    ALTER TABLE token_ledger ADD CONSTRAINT token_ledger_tokens_nonneg CHECK (tokens >= 0);
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_token_ledger_user_created
   ON token_ledger (user_id, created_at DESC);

@@ -66,6 +66,12 @@ export class DocumentQueueService implements OnModuleInit, OnModuleDestroy {
     return job ? await job.getState() : null;
   }
 
+  /** 워커가 마지막으로 보고한 토큰 번호 (아직 시작 전이면 0) */
+  async getJobProgress(jobId: string): Promise<number> {
+    const job = await this.queue.getJob(jobId);
+    return job && isTokenProgress(job.progress) ? job.progress.index : 0;
+  }
+
   async enqueue(jobId: string, data: CreateDocumentJob): Promise<void> {
     await this.queue.add(DOCUMENT_JOB_NAME, data, {
       jobId,

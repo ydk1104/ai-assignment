@@ -12,6 +12,8 @@ export interface RecordInput {
   maxTokens: number;
   /** 생성한 토큰들의 내용. 1번째 토큰이 contents[0]. 토큰 수 = contents.length */
   contents: string[];
+  /** 취소로 중단되어 그때까지 만든 것만으로 확정한 경우 true */
+  cancelled?: boolean;
 }
 
 export interface RecordResult {
@@ -25,6 +27,8 @@ export interface StoredResult {
   id: string;
   tokens: number;
   requestHash: string;
+  /** 취소로 끝난 요청이면 true (그때까지 만든 토큰만큼만 저장되어 있음) */
+  cancelled: boolean;
 }
 
 export interface StoredToken {
@@ -61,14 +65,20 @@ export class TokenLedgerService {
       id: string;
       tokens: number;
       request_hash: string;
+      cancelled: boolean;
     }>(
-      `SELECT id, tokens, request_hash FROM token_ledger
+      `SELECT id, tokens, request_hash, cancelled FROM token_ledger
        WHERE user_id = $1 AND idempotency_key = $2`,
       [userId, idempotencyKey],
     );
     const row = rows[0];
     return row
-      ? { id: row.id, tokens: row.tokens, requestHash: row.request_hash }
+      ? {
+          id: row.id,
+          tokens: row.tokens,
+          requestHash: row.request_hash,
+          cancelled: row.cancelled,
+        }
       : null;
   }
 
@@ -95,16 +105,18 @@ export class TokenLedgerService {
       await client.query("BEGIN");
 
       const inserted = await client.query<{ id: string }>(
-        `INSERT INTO token_ledger (user_id, idempotency_key, request_hash, max_tokens, tokens)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO token_ledger
+           (user_id, idempotency_key, request_hash, max_tokens, tokens, cancelled)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (user_id, idempotency_key) DO NOTHING
          RETURNING id`,
         [
           input.userId,
           input.idempotencyKey,
           input.requestHash,
-          input.maxTokens,
+          input.maxTokens, // 요청 때 받은 값을 그대로 둔다 (멱등성 비교/감사용). 실제 확정 개수는 tokens
           tokens,
+          input.cancelled ?? false,
         ],
       );
 

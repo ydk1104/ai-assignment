@@ -107,7 +107,16 @@ export interface GenerateOptions {
   sleep: (ms: number) => Promise<void>;
   /** 토큰이 하나 만들어질 때마다 호출 (번호, 내용) */
   onProgress?: (index: number, content: string) => void | Promise<void>;
+  /** 토큰을 만들기 전에 매번 호출. true면 그때까지 만든 것으로 생성을 마친다 (취소) */
+  shouldStop?: (generated: number) => boolean;
   failRate?: number;
+}
+
+export interface GenerateResult {
+  /** 만든 토큰들의 내용 (취소된 경우 취소 시점까지) */
+  contents: string[];
+  /** 취소로 중단되어 계획한 개수보다 적게 만들고 끝났는지 */
+  cancelled: boolean;
 }
 
 /**
@@ -120,10 +129,15 @@ export interface GenerateOptions {
  *   4) 토큰마다                : 지연 -> 내용
  * 그 뒤 실제로 토큰을 하나씩 만들면서(지연 포함) 누적 개수가 failAt에 도달하는 순간 에러를 던진다.
  * failAt이 0이면 하나도 만들기 전에, N이면 전부 만든 직후에 실패한다.
+ *
+ * 취소(shouldStop): 매 토큰을 만들기 전에 확인해서 true면 그때까지 만든 것으로 끝낸다
+ * (= 전체 개수 N을 지금까지 만든 개수로 줄여서 정상 완료한 것과 같다).
+ * 취소 확인이 에러 확인보다 먼저라서, 에러 지점에 도달한 순간에 취소가 들어와 있으면 에러 대신 취소로 끝난다.
+ * 이미 N개를 모두 만들었다면 취소는 의미가 없으므로 정상 완료로 본다.
  */
 export async function generateTokens(
   options: GenerateOptions,
-): Promise<string[]> {
+): Promise<GenerateResult> {
   const {
     maxTokens,
     rng,
@@ -131,6 +145,7 @@ export async function generateTokens(
     content,
     sleep,
     onProgress,
+    shouldStop,
     failRate = FAIL_RATE,
   } = options;
 
@@ -140,8 +155,10 @@ export async function generateTokens(
 
   const contents: string[] = [];
   for (let generated = 0; ; generated++) {
+    if (generated < total && shouldStop?.(generated))
+      return { contents, cancelled: true };
     if (generated === failAt) throw new TokenCreateFailError(generated, total);
-    if (generated === total) return contents;
+    if (generated === total) return { contents, cancelled: false };
 
     await sleep(delay()); // 토큰 하나 생성
     const index = generated + 1;

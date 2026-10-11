@@ -86,4 +86,37 @@ export class IdempotencyLockService {
     );
     return Number(result) === 1;
   }
+
+  // ---- 취소 요청 표시 ----
+  // 키에 jobId가 들어가므로, 예전 job에 대한 취소 표시가 같은 Idempotency-Key로 다시 시작한 새 job에 영향을 주지 않는다.
+
+  private cancelKey(jobId: string): string {
+    return `cancel:${jobId}`;
+  }
+
+  /**
+   * 이 job을 취소하라고 표시한다. atTokens는 취소를 요청한 시점에 보인 진행 개수다.
+   * 이미 표시돼 있으면 처음 요청한 시점을 그대로 유지한다 (취소를 여러 번 호출해도 결과가 같다).
+   */
+  async requestCancel(jobId: string, atTokens: number): Promise<void> {
+    await this.redis.client.set(
+      this.cancelKey(jobId),
+      String(atTokens),
+      "PX",
+      LOCK_TTL_MS,
+      "NX",
+    );
+  }
+
+  /** 취소가 요청됐으면 그 시점의 개수, 아니면 null */
+  async getCancelAt(jobId: string): Promise<number | null> {
+    const raw = await this.redis.client.get(this.cancelKey(jobId));
+    if (raw === null) return null;
+    const n = Number(raw);
+    return Number.isInteger(n) && n >= 0 ? n : 0;
+  }
+
+  async clearCancel(jobId: string): Promise<void> {
+    await this.redis.client.del(this.cancelKey(jobId));
+  }
 }
