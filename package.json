@@ -6,7 +6,9 @@
     "build": "nest build",
     "start": "nest start",
     "start:dev": "nest start --watch",
-    "start:worker": "node dist/worker.js"
+    "start:worker": "node dist/worker.js",
+    "test:unit": "npm run build && node test/run.js --unit",
+    "test:docker": "node test/test-docker.js"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.0",

@@ -1,0 +1,55 @@
+# 테스트 전용 스택. 개발용 스택(docker-compose.yml)과 겹치지 않게 따로 띄우고, test 컨테이너가 테스트를 실행한 뒤 종료한다.
+#
+#   npm run test:docker
+#   (= docker compose -p nest-app-test -f docker-compose.yml -f docker-compose.test.yml up --build --exit-code-from test)
+#
+# - 프로젝트 이름을 nest-app-test 로 따로 써서 컨테이너/네트워크/볼륨이 개발 스택과 분리된다 (끝나면 down -v 로 정리)
+# - 호스트 포트를 열지 않아서 개발 스택이 떠 있어도 충돌하지 않는다 (필요한 통신은 전부 도커 네트워크 안에서)
+# - API/워커는 development 모드: 토큰 생성 지연 10ms 고정, 토큰 내용 = 토큰 번호
+# - 난수 seed를 고정한다 (TEST_SEED). 같은 seed면 토큰 수/실패 여부/실패 지점이 항상 같아서 테스트가 결정적이다.
+#     test/seeds.json 의 main(42)    : 테스트에 쓰는 모든 maxTokens에서 실패하지 않는 seed
+#     test/seeds.json 의 failure(120): 항상 생성 도중(maxTokens 1000이면 438번째)에 token_create_fail 이 나는 seed
+#   scripts/test-docker.js 가 두 단계(main -> failure)를 차례로 실행하며 TEST_SEED / TEST_PHASE 를 넣어준다.
+#   직접 실행하려면:  TEST_SEED=42 TEST_PHASE=main docker compose -p nest-app-test -f docker-compose.yml -f docker-compose.test.yml up --build --exit-code-from test
+# - Docker Compose v2.24 이상 필요 (`!reset` 태그)
+
+services:
+  nginx:
+    ports: !reset []
+
+  postgres:
+    ports: !reset []
+
+  redis:
+    ports: !reset []
+
+  api-1:
+    environment:
+      NODE_ENV: development
+      RANDOM_SEED: ${TEST_SEED:-}   # .env 의 RANDOM_SEED 는 무시하고 테스트용 고정 seed 사용
+
+  api-2:
+    environment:
+      NODE_ENV: development
+      RANDOM_SEED: ${TEST_SEED:-}   # .env 의 RANDOM_SEED 는 무시하고 테스트용 고정 seed 사용
+
+  worker:
+    environment:
+      NODE_ENV: development   # seed는 API가 job에 담아 보내므로 워커에는 따로 필요 없다
+
+  test:
+    build:
+      context: .
+      target: test
+    environment:
+      NODE_ENV: development
+      RANDOM_SEED: ${TEST_SEED:-}   # 테스트가 기대값(토큰 수, 실패 지점)을 계산할 때 쓴다
+      TEST_PHASE: ${TEST_PHASE:-main}
+      BASE_URL: http://nginx
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-app}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-app_password}
+      DB_NAME: ${POSTGRES_DB:-app}
+    depends_on:
+      - nginx
