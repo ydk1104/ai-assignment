@@ -1,5 +1,6 @@
 import { Injectable, UnprocessableEntityException } from "@nestjs/common";
 import type { PoolClient } from "pg";
+import { CreditService } from "../credits/credit.service";
 import { DatabaseService } from "../database/database.service";
 
 /** 토큰 내용을 한 번에 몇 개씩 INSERT 할지 */
@@ -14,6 +15,8 @@ export interface RecordInput {
   contents: string[];
   /** 취소로 중단되어 그때까지 만든 것만으로 확정한 경우 true */
   cancelled?: boolean;
+  /** 이 생성 시도(job)의 id. 이 job이 잡아둔 크레딧 예약을 같은 트랜잭션에서 정산하는 데 쓴다 */
+  jobId: string;
 }
 
 export interface RecordResult {
@@ -38,11 +41,15 @@ export interface StoredToken {
 
 @Injectable()
 export class TokenLedgerService {
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly credits: CreditService,
+  ) {}
 
   /**
-   * 원장(token_ledger)에 한 줄 추가하고, 토큰 내용(generated_tokens)과 유저별 합계(user_token_totals)를 함께 저장한다.
-   * 셋은 한 트랜잭션이라 항상 같이 반영되거나 같이 취소된다.
+   * 원장(token_ledger)에 한 줄 추가하고, 토큰 내용(generated_tokens), 유저별 합계(user_token_totals),
+   * 크레딧 정산(생성한 토큰 수만큼 차감 + 예약 해제)을 함께 저장한다.
+   * 모두 한 트랜잭션이라 항상 같이 반영되거나 같이 취소된다.
    * 같은 (userId, Idempotency-Key)가 다시 오면 아무것도 쌓지 않고 저장된 값을 돌려준다.
    */
   async record(input: RecordInput): Promise<RecordResult> {
@@ -130,6 +137,12 @@ export class TokenLedgerService {
                  updated_at = now()`,
           [input.userId, tokens],
         );
+        // 크레딧 정산: 생성한 토큰 수만큼 차감하고 예약을 푼다 (같은 job이 다시 와도 한 번만)
+        await this.credits.settle(client, {
+          userId: input.userId,
+          jobId: input.jobId,
+          tokens,
+        });
         await client.query("COMMIT");
         return { tokens, replayed: false, storedHash: input.requestHash };
       }

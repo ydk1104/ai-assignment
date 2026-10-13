@@ -29,11 +29,13 @@ services:
   api-1:
     environment:
       NODE_ENV: development
+      INITIAL_CREDIT: "10000" # 테스트에서 "크레딧 부족"을 쉽게 만들 수 있도록 작게
       RANDOM_SEED: ${TEST_SEED:-} # .env 의 RANDOM_SEED 는 무시하고 테스트용 고정 seed 사용
 
   api-2:
     environment:
       NODE_ENV: development
+      INITIAL_CREDIT: "10000" # 테스트에서 "크레딧 부족"을 쉽게 만들 수 있도록 작게
       RANDOM_SEED: ${TEST_SEED:-} # .env 의 RANDOM_SEED 는 무시하고 테스트용 고정 seed 사용
 
   worker:
@@ -42,6 +44,7 @@ services:
     restart: "no"
     environment:
       NODE_ENV: development # seed는 API가 job에 담아 보내므로 워커에는 따로 필요 없다
+      INITIAL_CREDIT: "10000"
 
   test:
     build:
@@ -49,6 +52,7 @@ services:
       target: test
     environment:
       NODE_ENV: development
+      INITIAL_CREDIT: "10000" # 서버와 같은 값 (테스트가 잔액 기대값을 계산할 때 쓴다)
       RANDOM_SEED: ${TEST_SEED:-} # 테스트가 기대값(토큰 수, 실패 지점)을 계산할 때 쓴다
       TEST_PHASE: ${TEST_PHASE:-main}
       BASE_URL: http://nginx

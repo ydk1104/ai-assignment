@@ -283,3 +283,191 @@ test("완료된 요청을 취소하면 completed 로 그대로 알려준다", as
     cancelled: false,
   });
 });
+
+// ---------------------------------------------------------------- 크레딧
+
+const INITIAL = Number(process.env.INITIAL_CREDIT ?? 10000); // 서버가 새 유저에게 지급하는 초기 크레딧
+const getCredit = async (userId) => {
+  const res = await fetch(
+    `${BASE}/credit?userId=${encodeURIComponent(userId)}`,
+  );
+  assert.equal(res.status, 200);
+  return res.json();
+};
+// 조건이 맞을 때까지 잠깐씩 기다린다 (취소 요청 직후 정산이 끝나길 기다릴 때)
+async function eventually(fn, message, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await fn();
+    if (value) return value;
+    if (Date.now() > deadline) assert.fail(message);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+}
+
+test("GET /credit: userId 가 없으면 400", async () => {
+  assert.equal((await fetch(`${BASE}/credit`)).status, 400);
+  assert.equal((await fetch(`${BASE}/credit?userId=`)).status, 400);
+});
+
+test("GET /credit: 처음 조회하면 초기 크레딧이 지급된다 (잔액, 예약, 실제 잔액)", async () => {
+  const userId = `e2e-credit-${run}-init`;
+  assert.deepEqual(await getCredit(userId), {
+    userId,
+    balance: INITIAL,
+    reserved: 0,
+    available: INITIAL,
+  });
+  assert.deepEqual(
+    await getCredit(userId),
+    { userId, balance: INITIAL, reserved: 0, available: INITIAL },
+    "다시 조회해도 다시 지급되지 않음",
+  );
+});
+
+test("생성이 끝나면 생성된 토큰 수만큼만 차감되고 예약은 풀린다. 재생/중복 요청은 차감하지 않는다", async () => {
+  const userId = `e2e-credit-${run}-settle`;
+  const body = { userId, prompt: "p", maxTokens: 200 };
+  const { key, tokens } = await generateOk(body, "credit-settle");
+
+  const after = await getCredit(userId);
+  assert.equal(
+    after.balance,
+    INITIAL - tokens.length,
+    "생성된 토큰 수만큼만 차감 (maxTokens 200 전부가 아님)",
+  );
+  assert.equal(after.reserved, 0);
+  assert.equal(after.available, INITIAL - tokens.length);
+
+  await readSse(await create(body, key)); // 같은 키로 재생
+  assert.deepEqual(
+    await getCredit(userId),
+    after,
+    "재생은 크레딧을 건드리지 않음",
+  );
+});
+
+test("생성 중에는 maxTokens 만큼 예약되고(중복 요청은 예약을 늘리지 않음), 취소하면 생성된 만큼만 차감된다", async () => {
+  const userId = `e2e-credit-${run}-reserve`;
+  const { key, body } = await startLong(userId, "credit-reserve"); // maxTokens 5000, 첫 토큰을 받은 상태
+  assert.ok(
+    INITIAL >= body.maxTokens,
+    `테스트 전제: 초기 크레딧(${INITIAL}) >= ${body.maxTokens}`,
+  );
+
+  const during = await getCredit(userId);
+  assert.equal(during.balance, INITIAL, "아직 차감되지 않음");
+  assert.equal(during.reserved, body.maxTokens, "maxTokens 만큼 예약");
+  assert.equal(
+    during.available,
+    INITIAL - body.maxTokens,
+    "실제 잔액 = 잔액 - 예약",
+  );
+
+  assert.equal((await create(body, key)).status, 409); // 같은 키 중복 요청
+  assert.equal(
+    (await getCredit(userId)).reserved,
+    body.maxTokens,
+    "중복 요청이 예약을 더 잡지 않음",
+  );
+
+  const cancel = await post("/cancel_document", {
+    userId,
+    idempotencyKey: key,
+  });
+  assert.ok([200, 202].includes(cancel.status));
+  const settled = await eventually(async () => {
+    const c = await getCredit(userId);
+    return c.reserved === 0 ? c : null;
+  }, "취소 후 예약이 풀리지 않았어요");
+  assert.ok(
+    settled.balance < INITIAL && settled.balance > INITIAL - body.maxTokens,
+    `생성된 만큼만 차감 (잔액 ${settled.balance})`,
+  );
+  assert.equal(settled.available, settled.balance);
+  if (cancel.status === 200)
+    assert.equal(settled.balance, INITIAL - (await cancel.json()).tokens);
+});
+
+test(
+  '크레딧이 부족하면 402 "크레딧이 부족합니다."이고 잔액/예약은 그대로이며, 같은 키로 다시 요청할 수 있다',
+  { skip: INITIAL >= 1_000_000 },
+  async () => {
+    const userId = `e2e-credit-${run}-poor`;
+    const key = newKey("credit-poor");
+
+    const res = await create(
+      { userId, prompt: "p", maxTokens: INITIAL + 1 },
+      key,
+    );
+    assert.equal(res.status, 402);
+    assert.equal((await res.json()).message, "크레딧이 부족합니다.");
+    assert.deepEqual(await getCredit(userId), {
+      userId,
+      balance: INITIAL,
+      reserved: 0,
+      available: INITIAL,
+    });
+
+    // 거절된 요청이 "생성 중" 표시를 남기지 않았으므로, 같은 키로 (모자라지 않게) 다시 요청하면 정상 처리된다
+    const retry = await create({ userId, prompt: "p", maxTokens: 100 }, key);
+    assert.equal(retry.status, 200);
+    const { end } = await readSse(retry);
+    assert.equal(
+      end?.event === "done" || end?.data?.error === "token_create_fail",
+      true,
+    );
+  },
+);
+
+test("같은 유저가 동시에 여러 번 요청해도 크레딧이 음수가 되지 않는다 (예약)", async () => {
+  const userId = `e2e-credit-${run}-race`;
+  const each = Math.floor(INITIAL * 0.4); // 2건은 들어가고(0.8) 3번째는 모자란다(1.2)
+  const keys = [newKey("race"), newKey("race"), newKey("race")];
+
+  const responses = await Promise.all(
+    keys.map((key) => create({ userId, prompt: "p", maxTokens: each }, key)),
+  );
+  const statuses = responses.map((r) => r.status).sort();
+  assert.deepEqual(
+    statuses,
+    [200, 200, 402],
+    `동시 요청 3건 중 정확히 2건만 예약돼야 함: ${statuses}`,
+  );
+  const rejected = responses.find((r) => r.status === 402);
+  assert.equal((await rejected.json()).message, "크레딧이 부족합니다.");
+
+  const accepted = [];
+  for (let i = 0; i < responses.length; i++) {
+    if (responses[i].status === 200) {
+      await readSse(responses[i], 1); // 첫 토큰만 받고 연결을 끊는다 (생성은 계속됨)
+      accepted.push(keys[i]);
+    }
+  }
+  const during = await getCredit(userId);
+  assert.equal(during.balance, INITIAL);
+  assert.equal(during.reserved, each * 2);
+  assert.ok(
+    during.available >= 0,
+    `실제 잔액이 음수가 되면 안 됨: ${during.available}`,
+  );
+  assert.equal(during.available, INITIAL - each * 2);
+
+  // 정리: 둘 다 취소하면 생성된 만큼만 차감되고 예약은 풀린다
+  for (const key of accepted)
+    assert.ok(
+      [200, 202].includes(
+        (await post("/cancel_document", { userId, idempotencyKey: key }))
+          .status,
+      ),
+    );
+  const final = await eventually(async () => {
+    const c = await getCredit(userId);
+    return c.reserved === 0 ? c : null;
+  }, "취소 후 예약이 풀리지 않았어요");
+  assert.ok(
+    final.balance >= 0 && final.balance < INITIAL,
+    `최종 잔액 ${final.balance}`,
+  );
+  assert.equal(final.available, final.balance);
+});

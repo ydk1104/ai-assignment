@@ -5,6 +5,7 @@ import {
   Controller,
   Headers,
   HttpException,
+  HttpStatus,
   Logger,
   Post,
   Res,
@@ -14,6 +15,11 @@ import {
 import type { Response } from "express";
 import { createHash, randomUUID } from "crypto";
 import { parseSeed } from "../common/random";
+import {
+  INSUFFICIENT_CREDIT_MESSAGE,
+  InsufficientCreditError,
+} from "../credits/credit-math";
+import { CreditService } from "../credits/credit.service";
 import { CreateDocumentDto } from "./create-document.dto";
 import {
   TOKEN_CREATE_FAIL,
@@ -57,6 +63,7 @@ export class DocumentsController {
     private readonly ledger: TokenLedgerService,
     private readonly locks: IdempotencyLockService,
     private readonly queue: DocumentQueueService,
+    private readonly credits: CreditService,
   ) {}
 
   @Post()
@@ -95,7 +102,11 @@ export class DocumentsController {
         return this.replay(res, finished, requestHash, lastEventId);
       }
 
-      // 4) 이벤트 구독 -> 큐에 넣기 -> SSE 시작
+      // 4) 크레딧 예약: maxTokens 만큼 잡아둔다. 실제로 쓸 수 있는 잔액(잔액 - 예약)이 모자라면 402.
+      //    예약은 유저별로 한 줄씩 처리되므로, 같은 유저가 동시에 여러 번 요청해도 크레딧이 음수가 되지 않는다.
+      await this.reserveCredit(dto.userId, key, jobId, dto.maxTokens);
+
+      // 5) 이벤트 구독 -> 큐에 넣기 -> SSE 시작
       this.setSseHeaders(res);
       live = this.attach(res, jobId, dto.userId, key);
       await this.queue.enqueue(jobId, {
@@ -109,6 +120,7 @@ export class DocumentsController {
       });
     } catch (err) {
       live?.cancel();
+      await this.credits.release(jobId).catch(() => undefined); // 예약했다면 푼다 (예약 전에 실패했으면 아무 일도 없음)
       await this.locks
         .release(dto.userId, key, lockValue)
         .catch(() => undefined);
@@ -121,6 +133,25 @@ export class DocumentsController {
 
     res.flushHeaders();
     await live.done;
+  }
+
+  private async reserveCredit(
+    userId: string,
+    key: string,
+    jobId: string,
+    maxTokens: number,
+  ) {
+    try {
+      await this.credits.reserve(userId, key, jobId, maxTokens);
+    } catch (err) {
+      if (err instanceof InsufficientCreditError) {
+        throw new HttpException(
+          INSUFFICIENT_CREDIT_MESSAGE,
+          HttpStatus.PAYMENT_REQUIRED,
+        );
+      }
+      throw err;
+    }
   }
 
   /** 메모를 남기거나, 이미 있으면 상황에 맞게 거절한다 */

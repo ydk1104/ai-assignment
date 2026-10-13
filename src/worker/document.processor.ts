@@ -8,6 +8,7 @@ import { Job, Worker } from "bullmq";
 import { hostname } from "os";
 import { createRng } from "../common/random";
 import { redisConnection } from "../common/redis-options";
+import { CreditService } from "../credits/credit.service";
 import {
   CreateDocumentJob,
   DOCUMENT_QUEUE,
@@ -38,6 +39,7 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly ledger: TokenLedgerService,
     private readonly locks: IdempotencyLockService,
+    private readonly credits: CreditService,
   ) {}
 
   onModuleInit() {
@@ -66,6 +68,8 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
         void this.locks
           .release(userId, idempotencyKey, lockValue)
           .catch(() => undefined);
+        // 크레딧 예약도 푼다 (이미 정산/해제됐으면 아무 일도 없음). 처리하던 워커가 죽어서 못 푼 경우를 위한 것
+        void this.credits.release(String(job.id)).catch(() => undefined);
       }
     });
 
@@ -119,6 +123,7 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
         this.logger.log(
           `job ${job.id} skipped: already recorded (${already.tokens} tokens)`,
         );
+        await this.credits.release(jobId); // 이 job이 잡아둔 예약은 필요 없다 (이미 기록한 쪽이 정산함)
         return { tokens: already.tokens };
       }
 
@@ -145,11 +150,26 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
         maxTokens,
         contents,
         cancelled,
+        jobId,
       });
+      // 다른 job이 먼저 같은 요청을 기록한 경우(replayed): 이 job은 정산되지 않았으니 예약을 푼다.
+      // (같은 job이 워커 교체로 다시 실행된 경우엔 이미 정산돼 있어서 아무 일도 없다)
+      if (result.replayed) await this.credits.release(jobId);
       this.logger.log(
         `[${hostname()}] job ${job.id} ${cancelled ? "cancelled" : "done"}: ${result.tokens} tokens (userId=${userId})`,
       );
       return { tokens: result.tokens };
+    } catch (err) {
+      // 생성 실패(token_create_fail 등): 과금하지 않고 예약만 푼다. 메모를 지우기 전에 풀어야, 실패를 본 클라이언트가
+      // 바로 같은 키로 재시도해도 자기 예약 때문에 크레딧이 부족해지지 않는다.
+      await this.credits
+        .release(jobId)
+        .catch((releaseErr) =>
+          this.logger.warn(
+            `failed to release credit reservation: ${(releaseErr as Error).message}`,
+          ),
+        );
+      throw err;
     } finally {
       // 정상 종료/에러 모두 메모 삭제. 원장 기록 이후에 지우므로, 메모가 없으면 원장에는 결과가 있다.
       // 에러로 끝난 경우엔 메모가 지워져서 같은 Idempotency-Key로 다시 요청할 수 있다.
