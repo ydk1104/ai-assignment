@@ -18,6 +18,7 @@ const PHASE = process.env.TEST_PHASE ?? "main";
 // seed가 고정이면 결과가 항상 같으므로 "판단 불가"는 seed 설정이 잘못된 것 -> 재시도하지 않고 실패로 본다.
 // seed가 없는(랜덤) 모드에서만, 10% 확률로 일부러 내는 에러 때문에 "판단 불가(종료 코드 2)"면 다시 실행한다.
 const RANDOM_MODE = !process.env.RANDOM_SEED;
+const DOCKER_SOCKET = process.env.DOCKER_SOCKET ?? "/var/run/docker.sock";
 const MAX_ATTEMPTS = 5;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -101,6 +102,21 @@ function runStep(name, args, { retryOnInconclusive = false } = {}) {
           { retryOnInconclusive: RANDOM_MODE },
         ),
       );
+      // 워커를 죽여 보는 테스트는 도커 소켓이 필요하다 (docker-compose.test.yml 이 test 컨테이너에 마운트)
+      if (fs.existsSync(DOCKER_SOCKET))
+        results.push(
+          runStep("워커 장애 복구 (e2e-failover)", [
+            "--test",
+            "test/e2e-failover.js",
+          ]),
+        );
+      else
+        results.push({
+          name: "워커 장애 복구 (e2e-failover)",
+          ok: true,
+          skipped: true,
+          note: `도커 소켓(${DOCKER_SOCKET})이 없어 건너뜀`,
+        });
     }
     if (process.env.SKIP_DB_CHECK === "1")
       console.log("\n(SKIP_DB_CHECK=1: DB 정합성 검사 생략)");
@@ -110,7 +126,7 @@ function runStep(name, args, { retryOnInconclusive = false } = {}) {
   console.log("\n================ 결과 ================");
   for (const r of results)
     console.log(
-      `${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.note ? ` (${r.note})` : ""}`,
+      `${r.skipped ? "SKIP" : r.ok ? "PASS" : "FAIL"}  ${r.name}${r.note ? ` (${r.note})` : ""}`,
     );
   const failed = results.filter((r) => !r.ok).length;
   console.log(failed === 0 ? "\n모든 테스트 통과" : `\n${failed}개 단계 실패`);

@@ -9,7 +9,7 @@
 //   실패하면 test-logs/ 를 남기고 요약을 출력한다:
 //     test-logs/error.log          실패 요약 (실패한 단계/테스트와 에러 메시지, 서비스의 에러/경고 로그)
 //     test-logs/<단계>/test.log    test 컨테이너 전체 출력
-//     test-logs/<단계>/up.log      docker compose up 전체 출력 (이미지 빌드 + 모든 컨테이너 로그가 섞여 있음)
+//     test-logs/<단계>/up.log      이미지 빌드/스택 기동 출력 (docker compose up -d)
 //     test-logs/<단계>/<서비스>.log api-1, api-2, worker, nginx, postgres, redis 각각의 로그
 // 옵션: --verbose 테스트 컨테이너 출력을 전부 보여준다 / --keep-logs 성공해도 로그를 남긴다
 const { spawn, spawnSync } = require("child_process");
@@ -50,15 +50,12 @@ const rel = (p) => path.relative(process.cwd(), p) || p;
 const short = (text, max = 160) =>
   text.length > max ? `${text.slice(0, max - 1)}…` : text;
 
-// docker compose 가 붙이는 "test-1   | " 접두어. test 컨테이너의 줄만 골라낸다
-// (compose 버전에 따라 "test-1" 또는 "nest-app-test-test-1" 형태)
-const TEST_PREFIX = /^(?:nest-app-test-)?test-\d+\s+\|\s?(.*)$/;
 // 기본(간단) 모드에서 콘솔에 보여줄 test 컨테이너 출력
 const SHOW = [
   /^단계:/,
   /^스택 대기/,
   /^=== /,
-  /^(PASS|FAIL)  /,
+  /^(PASS|FAIL|SKIP)  /,
   /^# (pass|fail) /,
   /^모든 테스트 통과/,
   /개 단계 실패/,
@@ -69,45 +66,114 @@ const SHOW = [
 
 const endStream = (stream) => new Promise((resolve) => stream.end(resolve));
 
-// docker compose up 을 실행하면서 전체 출력은 up.log, test 컨테이너 출력은 test.log 에 저장하고 콘솔에는 진행 상황만 보여준다
-function runUp(dir, env) {
-  return new Promise((resolve) => {
-    const upLog = fs.createWriteStream(path.join(dir, "up.log"));
-    const testLog = fs.createWriteStream(path.join(dir, "test.log"));
-    let settled = false;
-    const finish = async (code) => {
-      if (settled) return;
-      settled = true;
-      await Promise.all([endStream(upLog), endStream(testLog)]);
-      resolve(code);
-    };
+const TEST_TIMEOUT_MS = Number(process.env.TEST_TIMEOUT_MS ?? 20 * 60 * 1000); // test 컨테이너가 이 시간 안에 끝나야 한다
 
-    const child = spawn(
-      "docker",
-      [...compose, "up", "--build", "--no-color", "--exit-code-from", "test"],
-      {
-        cwd: ROOT,
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
+// docker compose 명령을 실행하고 출력을 줄 단위로 onLine 에 넘긴다. { child, done(종료 코드 Promise) }
+function startCompose(args, env, onLine) {
+  const child = spawn("docker", [...compose, ...args], {
+    cwd: ROOT,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const done = new Promise((resolve) => {
+    let settled = false;
+    const finish = (code) => {
+      if (!settled) {
+        settled = true;
+        resolve(code);
+      }
+    };
     child.on("error", (err) => {
-      upLog.write(`docker 실행 실패: ${err.message}\n`);
+      onLine(`docker 실행 실패: ${err.message}`);
       console.error(`docker 실행 실패: ${err.message}`);
       finish(1);
     });
-
-    const onLine = (line) => {
-      upLog.write(`${line}\n`);
-      const m = TEST_PREFIX.exec(line);
-      if (!m) return;
-      testLog.write(`${m[1]}\n`);
-      if (VERBOSE || SHOW.some((re) => re.test(m[1]))) console.log(`  ${m[1]}`);
-    };
     readline.createInterface({ input: child.stdout }).on("line", onLine);
     readline.createInterface({ input: child.stderr }).on("line", onLine);
     child.on("close", (code) => finish(code ?? 1));
   });
+  return { child, done };
+}
+
+const dockerSync = (args, env) =>
+  spawnSync("docker", args, { cwd: ROOT, env, encoding: "utf8" });
+function containerId(service, env) {
+  const r = dockerSync([...compose, "ps", "-aq", service], env);
+  return (r.stdout ?? "").trim().split(/\s+/)[0] || null;
+}
+function inspectContainer(service, format, env) {
+  const id = containerId(service, env);
+  return id
+    ? (dockerSync(["inspect", "-f", format, id], env).stdout ?? "").trim()
+    : "";
+}
+
+// test 컨테이너의 로그를 따라가며 진행 상황만 콘솔에 보여준다. test 컨테이너가 끝나면 돌아온다 (시간 초과면 true)
+async function followTestLogs(env, testLog) {
+  const { child, done } = startCompose(
+    ["logs", "--no-color", "-f", "test"],
+    env,
+    (line) => {
+      const text = /^\S+\s+\|\s?(.*)$/.exec(line)?.[1] ?? line; // compose 가 붙인 "test-1  | " 접두어 제거
+      testLog.write(`${text}\n`);
+      if (VERBOSE || SHOW.some((re) => re.test(text))) console.log(`  ${text}`);
+    },
+  );
+
+  // logs -f 가 컨테이너 종료 후에도 끝나지 않는 경우를 대비해, 상태를 직접 확인하다가 끝났으면 잠시 뒤 로그 따라가기를 멈춘다
+  const deadline = Date.now() + TEST_TIMEOUT_MS;
+  let timedOut = false;
+  const watcher = setInterval(() => {
+    if (Date.now() > deadline) {
+      timedOut = true;
+      clearInterval(watcher);
+      child.kill();
+    } else if (
+      ["exited", "dead"].includes(
+        inspectContainer("test", "{{.State.Status}}", env),
+      )
+    ) {
+      clearInterval(watcher);
+      setTimeout(() => child.kill(), 3000); // 남은 로그를 마저 받을 시간
+    }
+  }, 2000);
+  await done;
+  clearInterval(watcher);
+  return timedOut;
+}
+
+// 이미지 빌드 -> 스택 기동 -> test 컨테이너 실행/완료 대기. test 컨테이너의 종료 코드를 돌려준다
+//
+// `up --exit-code-from test` 를 쓰지 않는 이유: 이 옵션은 "컨테이너가 하나라도 종료되면 전체를 중단"하는
+// --abort-on-container-exit 를 함께 켠다. 장애 복구 테스트가 워커 컨테이너를 일부러 죽이면 스택 전체가 내려가 버린다.
+async function runStack(dir, env) {
+  const upLog = fs.createWriteStream(path.join(dir, "up.log"));
+  const testLog = fs.createWriteStream(path.join(dir, "test.log"));
+  try {
+    // 1) 빌드 + 기동 (백그라운드). 의존 서비스가 healthy 가 되길 기다린 뒤 돌아온다. 출력은 up.log 에만
+    const upCode = await startCompose(["up", "-d", "--build"], env, (line) =>
+      upLog.write(`${line}\n`),
+    ).done;
+    if (upCode !== 0) return upCode;
+
+    // 2) test 컨테이너가 끝날 때까지 로그를 따라간다
+    const timedOut = await followTestLogs(env, testLog);
+    if (timedOut) {
+      upLog.write(
+        `test 컨테이너가 ${Math.round(TEST_TIMEOUT_MS / 1000)}초 안에 끝나지 않아 중단했어요\n`,
+      );
+      return 124;
+    }
+
+    // 3) test 컨테이너의 종료 코드
+    const code = parseInt(
+      inspectContainer("test", "{{.State.ExitCode}}", env),
+      10,
+    );
+    return Number.isNaN(code) ? 1 : code;
+  } finally {
+    await Promise.all([endStream(upLog), endStream(testLog)]);
+  }
 }
 
 // 스택이 내려가기 전에 서비스별 로그를 파일로 저장한다
@@ -216,6 +282,11 @@ function analyze(phase, code, dir) {
     "",
   ];
 
+  if (code === 124) {
+    const msg = `test 컨테이너가 ${Math.round(TEST_TIMEOUT_MS / 1000)}초 안에 끝나지 않아 중단했어요 (TEST_TIMEOUT_MS 환경변수로 조정). 어느 단계에서 멈췄는지는 test.log 마지막 줄을 보세요.`;
+    summary.push(`  ${msg}`);
+    detail.push(msg, "");
+  }
   if (!ranTests) {
     summary.push(
       "  테스트가 실행되기 전에 종료됐어요 (이미지 빌드 또는 스택 기동 실패일 수 있어요). docker compose 출력 마지막 줄:",
@@ -314,7 +385,7 @@ function analyze(phase, code, dir) {
       TEST_PHASE: phase.name,
     };
 
-    const code = await runUp(dir, env);
+    const code = await runStack(dir, env);
     if (code !== 0) saveServiceLogs(dir, env); // 스택을 내리기 전에 서비스 로그 저장
 
     const down = spawnSync(
