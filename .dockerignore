@@ -5,3 +5,4 @@ dist
 npm-debug.log
 Dockerfile
 docker-compose*.yml
+test-logs

@@ -1,4 +1,4 @@
-// 사용법: node scripts/resume-test.js [key=r-${Date.now().toString(36)}]
+// 사용법: node scripts/resume-test.js [URL=http://127.0.0.1/create_document]
 //
 // 1) 새 Idempotency-Key로 생성을 시작하고, 토큰 3개만 받은 뒤 연결을 끊는다 (생성은 워커에서 계속된다)
 // 2) 같은 키 + Last-Event-ID 로 다시 요청한다
@@ -7,9 +7,8 @@
 // 3) Last-Event-ID: 0 으로 전체를 다시 받아서, 1)에서 실시간으로 받은 토큰과 저장된 토큰의 내용이 같은지 비교한다
 //
 // 종료 코드: 0=PASS, 1=FAIL, 2=판단 불가(10% 확률로 일부러 내는 token_create_fail 때문에 다시 실행 필요)
-const url = "http://127.0.0.1/create_document";
-const key = process.argv[2] ?? `r-${Date.now().toString(36)}`;
-console.log(key);
+const url = process.argv[2] ?? "http://127.0.0.1/create_document";
+const key = `r-${Date.now().toString(36)}`;
 const body = JSON.stringify({
   userId: "resume-test",
   prompt: "hello",
@@ -80,6 +79,25 @@ async function failResponse(label, res) {
 function inconclusive(message) {
   console.log(`\n판단 불가: ${message}`);
   process.exit(2);
+}
+
+// 서버에 연결하지 못했을 때 원인을 알아보기 쉽게 안내한다 (그 외 에러는 null)
+function describeConnectionError(err, target) {
+  const code = err?.cause?.code ?? err?.code;
+  if (
+    !["ECONNREFUSED", "ENOTFOUND", "ECONNRESET", "EHOSTUNREACH"].includes(
+      code,
+    ) &&
+    err?.message !== "fetch failed"
+  )
+    return null;
+  return [
+    `서버에 연결할 수 없어요: ${target} (${code ?? err.message})`,
+    "  - 스택이 떠 있는지 확인하세요: docker compose ps",
+    "    (nginx 는 api-1, api-2 가 healthy 가 된 뒤에 시작돼요. API가 못 떴다면 nginx 도 없어서 80번 포트가 닫혀 있어요)",
+    "  - API 가 못 떴다면 로그를 보세요: docker compose logs --tail=50 api-1 worker",
+    "  - 테스트 전용 스택(npm run test:docker)은 호스트 포트를 열지 않아요. 호스트에서 이 스크립트를 직접 실행하려면 개발 스택(docker compose up -d)을 쓰세요.",
+  ].join("\n");
 }
 
 (async () => {
@@ -175,6 +193,6 @@ function inconclusive(message) {
   console.error("2분 안에 생성이 끝나지 않았어요.");
   process.exit(1);
 })().catch((e) => {
-  console.error(e);
+  console.error(describeConnectionError(e, url) ?? e);
   process.exit(1);
 });

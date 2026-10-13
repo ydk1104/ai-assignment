@@ -29,6 +29,25 @@ function parseEvent(block) {
   return seen ? ev : null;
 }
 
+// 서버에 연결하지 못했을 때 원인을 알아보기 쉽게 안내한다 (그 외 에러는 null)
+function describeConnectionError(err, target) {
+  const code = err?.cause?.code ?? err?.code;
+  if (
+    !["ECONNREFUSED", "ENOTFOUND", "ECONNRESET", "EHOSTUNREACH"].includes(
+      code,
+    ) &&
+    err?.message !== "fetch failed"
+  )
+    return null;
+  return [
+    `서버에 연결할 수 없어요: ${target} (${code ?? err.message})`,
+    "  - 스택이 떠 있는지 확인하세요: docker compose ps",
+    "    (nginx 는 api-1, api-2 가 healthy 가 된 뒤에 시작돼요. API가 못 떴다면 nginx 도 없어서 80번 포트가 닫혀 있어요)",
+    "  - API 가 못 떴다면 로그를 보세요: docker compose logs --tail=50 api-1 worker",
+    "  - 테스트 전용 스택(npm run test:docker)은 호스트 포트를 열지 않아요. 호스트에서 이 스크립트를 직접 실행하려면 개발 스택(docker compose up -d)을 쓰세요.",
+  ].join("\n");
+}
+
 (async () => {
   const res = await fetch(url, {
     method: "POST",
@@ -107,6 +126,6 @@ function parseEvent(block) {
   );
   process.exit(1);
 })().catch((e) => {
-  console.error(e);
+  console.error(describeConnectionError(e, url) ?? e);
   process.exit(1);
 });
