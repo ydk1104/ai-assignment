@@ -1,7 +1,8 @@
 name: nest-app
 
-x-app-env: &app-env
-  NODE_ENV: production
+x-app-env:
+  &app-env # production: 토큰 생성 지연 20~80ms 무작위 / 그 외(development 등): 10ms 고정 (.env의 APP_ENV로 전환)
+  NODE_ENV: ${APP_ENV:-production}
   PORT: 3000
   # PostgreSQL
   DB_HOST: postgres
@@ -14,6 +15,8 @@ x-app-env: &app-env
   REDIS_PORT: 6379
   # 비워두면 시간 기반 랜덤, 정수를 넣으면 해당 seed로 고정
   RANDOM_SEED: ${RANDOM_SEED:-}
+  # 새 유저에게 처음 지급하는 크레딧
+  INITIAL_CREDIT: ${INITIAL_CREDIT:-100000}
 
 x-app-base: &app-base
   build: .
@@ -25,6 +28,15 @@ x-app-base: &app-base
       condition: service_healthy
   restart: unless-stopped
 
+x-api-healthcheck: &api-healthcheck
+  # 앞서 만든 GET /status 로 확인. alpine에는 curl이 없어서 busybox wget 사용
+  # (localhost는 IPv6(::1)로 풀릴 수 있어 127.0.0.1 사용)
+  test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/status"]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  start_period: 10s
+
 services:
   nginx:
     image: nginx:1.27-alpine
@@ -33,17 +45,21 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - api-1
-      - api-2
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
     restart: unless-stopped
 
   api-1:
     <<: *app-base
     command: ["node", "dist/main.js"]
+    healthcheck: *api-healthcheck
 
   api-2:
     <<: *app-base
     command: ["node", "dist/main.js"]
+    healthcheck: *api-healthcheck
 
   # 생성 워커: BullMQ Worker가 Redis 큐에서 job을 가져감 (nginx 불필요)
   worker:
@@ -59,7 +75,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app_password}
       POSTGRES_DB: ${POSTGRES_DB:-app}
     ports:
-      - "5432:5432"   # 로컬 개발용. 운영에서는 제거
+      - "5432:5432" # 로컬 개발용. 운영에서는 제거
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
@@ -72,9 +88,16 @@ services:
   redis:
     image: redis:7-alpine
     # BullMQ는 maxmemory-policy가 noeviction이어야 job이 유실되지 않음
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--maxmemory-policy",
+        "noeviction",
+      ]
     ports:
-      - "6379:6379"   # 로컬 개발용. 운영에서는 제거
+      - "6379:6379" # 로컬 개발용. 운영에서는 제거
     volumes:
       - redis-data:/data
     healthcheck:
